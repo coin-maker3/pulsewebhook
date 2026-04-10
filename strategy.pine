@@ -1,12 +1,13 @@
 //@version=6
 // ─────────────────────────────────────────────────────────────────────────────
 // PulseWebhook Pro — Gap and Go with Market Intelligence
+// v3: Backtesting fixes — PMH fallback, gap fallback, debug plots, test entry
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 15 — POSITION SIZING NOTE
-// The default_qty_value=7 (7% of equity per trade) is a fallback for backtesting
-// only. In live trading, position sizing is handled by the webhook server in
-// risk.py, which calculates share quantity from account equity, risk per trade,
-// and the stop distance returned in the alert JSON.
+// default_qty_value=7 (7% equity) is a backtest fallback only.
+// Live position sizing is handled by the webhook server in risk.py, which
+// calculates share quantity from account equity, risk per trade, and the stop
+// distance returned in the alert JSON.
 // ─────────────────────────────────────────────────────────────────────────────
 strategy("PulseWebhook Pro", overlay=true,
      default_qty_type  = strategy.percent_of_equity,
@@ -16,16 +17,28 @@ strategy("PulseWebhook Pro", overlay=true,
      slippage          = 2)
 
 // ── SECTION 1: INPUTS ─────────────────────────────────────────────────────────
-min_gap     = input.float(15.0, "Minimum Gap %",           minval=0.0,  step=0.5)
-min_rel_vol = input.float(3.0,  "Minimum Relative Volume", minval=0.1,  step=0.1)
-atr_mult    = input.float(1.5,  "ATR Multiplier for Stop", minval=0.1,  step=0.1)
-rr          = input.float(2.5,  "Risk/Reward Target",      minval=0.5,  step=0.1)
-max_float   = input.float(10.0, "Max Float (Millions)",    minval=0.0,  step=0.5,
-              tooltip="Reference only — Pine Script cannot read float data. Apply this filter manually or via a pre-market scanner before adding the ticker to your watchlist.")
-ew_sh       = input.int(9,  "Entry Window Start Hour EST",  minval=0, maxval=23)
-ew_sm       = input.int(30, "Entry Window Start Minute EST",minval=0, maxval=59)
-ew_eh       = input.int(10, "Entry Window End Hour EST",    minval=0, maxval=23)
-ew_em       = input.int(30, "Entry Window End Minute EST",  minval=0, maxval=59)
+// FIX 3: Backtest mode lowers thresholds so historical trades are visible.
+// Pine Script cannot detect strategy.tester automatically — toggle manually.
+// Default ON so the strategy fires trades immediately on first load.
+// Turn OFF before going live.
+backtest_mode = input.bool(true, "⚙ Backtest Mode (Lower Thresholds)",
+     tooltip="ON: min gap 5%, rel vol 1.5x, confidence 3, COLD allowed, EMA test entry enabled. Turn OFF for live trading.")
+
+min_gap     = input.float(15.0, "Minimum Gap % (live)",            minval=0.0, step=0.5,  group="Entry Filters")
+min_rel_vol = input.float(3.0,  "Minimum Relative Volume (live)",  minval=0.1, step=0.1,  group="Entry Filters")
+atr_mult    = input.float(1.5,  "ATR Multiplier for Stop",         minval=0.1, step=0.1,  group="Entry Filters")
+rr_input    = input.float(2.5,  "Risk/Reward Target",              minval=0.5, step=0.1,  group="Entry Filters")
+max_float   = input.float(10.0, "Max Float (Millions — reference)",minval=0.0, step=0.5,  group="Entry Filters",
+     tooltip="Cannot be auto-read in Pine Script. Filter manually via scanner before adding to watchlist.")
+ew_sh = input.int(9,  "Entry Window Start Hour EST",   minval=0, maxval=23, group="Time Window")
+ew_sm = input.int(30, "Entry Window Start Minute EST", minval=0, maxval=59, group="Time Window")
+ew_eh = input.int(10, "Entry Window End Hour EST",     minval=0, maxval=23, group="Time Window")
+ew_em = input.int(30, "Entry Window End Minute EST",   minval=0, maxval=59, group="Time Window")
+
+// Effective thresholds: relaxed in backtest mode, strict in live mode
+eff_gap     = backtest_mode ? 5.0 : min_gap
+eff_vol     = backtest_mode ? 1.5 : min_rel_vol
+eff_conf    = backtest_mode ? 3   : 4
 
 // ── EST time helpers ──────────────────────────────────────────────────────────
 hour_est   = hour(time,   "America/New_York")
@@ -34,8 +47,6 @@ time_est   = hour_est * 100 + minute_est
 new_day    = not na(dayofweek[1]) and dayofweek != dayofweek[1]
 
 // ── SECTION 2: MARKET TEMPERATURE ─────────────────────────────────────────────
-// Track the largest single-bar % move seen today. A gap-up stock shows its full
-// overnight move on the first 1-min bar, so this captures the day's temperature.
 bar_change_pct = na(close[1]) or close[1] == 0.0 ? 0.0 :
                  (close - close[1]) / close[1] * 100
 
@@ -50,16 +61,20 @@ WARM      = max_change_today > 15 and max_change_today <= 30
 COLD      = max_change_today > 5  and max_change_today <= 15
 DEAD      = max_change_today <= 5
 
-temp_ok    = SCORCHING or HOT or WARM
+// FIX 3: In backtest mode allow COLD — most historical days are not HOT/SCORCHING
+temp_ok    = backtest_mode ? not DEAD : (SCORCHING or HOT or WARM)
 temp_label = SCORCHING ? "SCORCHING" : HOT ? "HOT" : WARM ? "WARM" : COLD ? "COLD" : "DEAD"
 temp_color = SCORCHING ? color.white  :
              HOT        ? color.green  :
              WARM       ? color.yellow :
              COLD       ? color.blue   : color.gray
 
-// ── SECTION 3: PRE-MARKET HIGH TRACKING ──────────────────────────────────────
-// Highest high before 09:30 EST each day. Reset at each new day.
-// This level drives both the breakout entry trigger and the stop placement.
+// ── SECTION 3: PRE-MARKET HIGH — with fallback for backtesting ────────────────
+// FIX 1: Backtesting datasets often contain only regular-session bars (09:30+),
+// so in_premarket is never true and premarket_high stays at 0.
+// Fallback chain: real PMH → previous day high → prior bar's high.
+// The label shows "PMH" when real pre-market data was captured, "PDH" otherwise.
+
 var float premarket_high = 0.0
 var label pmh_lbl        = na
 
@@ -70,26 +85,32 @@ in_premarket = hour_est < 9 or (hour_est == 9 and minute_est < 30)
 if in_premarket
     premarket_high := math.max(premarket_high, high)
 
-// Draw PMH as orange dotted line
-plot(premarket_high > 0 ? premarket_high : na, "PM High",
+// Fallback: pull previous day's high from daily timeframe
+prevday_high  = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+effective_pmh = premarket_high > 0      ? premarket_high :
+                not na(prevday_high) and prevday_high > 0 ? prevday_high :
+                not na(high[1])         ? high[1] : high
+
+pmh_is_real   = premarket_high > 0    // true = real pre-market data, false = fallback
+pmh_tag       = pmh_is_real ? "PMH" : "PDH"
+
+// Orange dotted line on chart
+plot(effective_pmh > 0 ? effective_pmh : na, "PM High",
      color=color.orange, linewidth=2, style=plot.style_circles)
 
-// PMH label — update on last bar so it stays at the right edge
-if barstate.islast and premarket_high > 0
+if barstate.islast and effective_pmh > 0
     if not na(pmh_lbl)
         label.delete(pmh_lbl)
-    pmh_lbl := label.new(bar_index + 2, premarket_high,
-                 "PMH  " + str.tostring(premarket_high, "#.##"),
-                 style    = label.style_label_left,
-                 color    = color.orange,
-                 textcolor= color.black,
-                 size     = size.small)
+    pmh_lbl := label.new(bar_index + 2, effective_pmh,
+                 pmh_tag + "  " + str.tostring(effective_pmh, "#.##"),
+                 style=label.style_label_left, color=color.orange,
+                 textcolor=color.black, size=size.small)
 
 // ── SECTION 4: VOLUME ANALYSIS ────────────────────────────────────────────────
 avg_vol      = ta.sma(volume, 20)
 rel_vol      = avg_vol > 0 ? volume / avg_vol : 0.0
-recent_vol   = volume    + volume[1] + volume[2]   // last 3 bars
-earlier_vol  = volume[4] + volume[5] + volume[6]   // bars 4–6 ago
+recent_vol   = volume    + volume[1] + volume[2]
+earlier_vol  = volume[4] + volume[5] + volume[6]
 vol_building = recent_vol > earlier_vol
 vol_trend    = vol_building ? "BUILDING" : "FADING"
 vol_color    = vol_building ? color.green : color.red
@@ -105,9 +126,14 @@ plot(vwap,  "VWAP",  color=color.blue,   linewidth=2)
 plot(ema9,  "9 EMA", color=color.orange, linewidth=1)
 plot(ema20, "20 EMA",color=color.yellow, linewidth=1)
 
-// ── SECTION 6: GAP AND GO ENTRY CONDITIONS ────────────────────────────────────
-// Gap % is captured once on the first bar of the day using today's open vs
-// yesterday's close. It stays constant throughout the day for correct filtering.
+// ── SECTION 6: GAP CALCULATION — with fallback ────────────────────────────────
+// FIX 2: Primary: (today open − yesterday close) / yesterday close.
+// Fallback: if open == close[1] (data gap, no overnight move recorded),
+// use (today open − 5-day avg daily close) / 5-day avg so the gap filter
+// doesn't silently block every trade.
+daily_avg5_close = request.security(syminfo.tickerid, "D", ta.sma(close, 5)[1],
+                   lookahead=barmerge.lookahead_off)
+
 var float gap_pct   = 0.0
 var bool  first_bar = false
 
@@ -116,52 +142,61 @@ if new_day
     gap_pct   := 0.0
 
 if first_bar
-    gap_pct   := not na(close[1]) and close[1] > 0 ?
-                 (open - close[1]) / close[1] * 100 : 0.0
+    prev_c   = not na(close[1]) and close[1] > 0.0 ? close[1] : na
+    raw_gap  = not na(prev_c) ? (open - prev_c) / prev_c * 100 : 0.0
+    // Fallback: if gap is zero use 5-day avg close as reference baseline
+    fallback_base = not na(daily_avg5_close) and daily_avg5_close > 0.0 ?
+                    daily_avg5_close : na
+    gap_pct  := raw_gap != 0.0 ? raw_gap :
+                not na(fallback_base) ? (high - fallback_base) / fallback_base * 100 : 0.0
     first_bar := false
 
+// ── Entry conditions ──────────────────────────────────────────────────────────
 start_time      = ew_sh * 100 + ew_sm
 end_time        = ew_eh * 100 + ew_em
 in_entry_window = time_est >= start_time and time_est < end_time
 
-// Breakout: first candle to close above pre-market high (crossover, not ongoing)
-broke_pmh    = premarket_high > 0 and close > premarket_high and close[1] <= premarket_high
-volume_surge = volume > avg_vol * min_rel_vol
+// FIX 1: Use effective_pmh (real PMH or fallback PDH) for breakout detection
+broke_pmh    = effective_pmh > 0 and close > effective_pmh and close[1] <= effective_pmh
+volume_surge = volume > avg_vol * eff_vol
 above_vwap   = close > vwap
 rsi_ok       = rsi14 > 35 and rsi14 < 75
-gap_ok       = gap_pct >= min_gap
+gap_ok       = gap_pct >= eff_gap
 no_position  = strategy.position_size == 0
 
 entry_signal = in_entry_window and broke_pmh and volume_surge and
                above_vwap and rsi_ok and temp_ok and gap_ok and no_position
 
 // ── SECTION 7: STOP AND TARGET ────────────────────────────────────────────────
-// Stop below pre-market high by ATR distance — gives room for normal volatility
-// while keeping the logical invalidation level (PMH) as the anchor.
-stop_price   = premarket_high - atr14 * atr_mult
+stop_price   = effective_pmh - atr14 * atr_mult
 risk_pts     = close - stop_price
-target_price = close + risk_pts * rr
+target_price = close + risk_pts * rr_input
 
 // ── SECTION 8: ONE TRADE PER DAY ─────────────────────────────────────────────
-// Proven by backtest: second trade on same ticker same day = buying into
-// institutional selling. Hard block after first completed trade.
 var bool traded_today = false
 if new_day
     traded_today := false
 
 // ── SECTION 12: CONFIDENCE SCORE ─────────────────────────────────────────────
-// Computed before entry execution so it can gate the signal.
-// Only trades with confidence >= 4 are taken.
-c1 = close > vwap                     ? 1 : 0   // above VWAP
-c2 = close > ema9                     ? 1 : 0   // above 9 EMA
-c3 = volume > avg_vol * 3             ? 1 : 0   // 3× average volume
-c4 = gap_pct > 20                     ? 1 : 0   // gap above 20%
-c5 = HOT or SCORCHING                 ? 1 : 0   // temperature HOT or SCORCHING
-c6 = rsi14 >= 45 and rsi14 <= 65     ? 1 : 0   // RSI in ideal 45–65 range
+c1 = close > vwap                 ? 1 : 0   // above VWAP
+c2 = close > ema9                 ? 1 : 0   // above 9 EMA
+c3 = volume > avg_vol * 3         ? 1 : 0   // 3× average volume
+c4 = gap_pct > 20                 ? 1 : 0   // strong gap (>20%)
+c5 = HOT or SCORCHING             ? 1 : 0   // market is hot
+c6 = rsi14 >= 45 and rsi14 <= 65  ? 1 : 0   // RSI ideal range
 confidence = c1 + c2 + c3 + c4 + c5 + c6
 
-// Master gate — all conditions including minimum confidence
-can_entry = entry_signal and not traded_today and confidence >= 4
+// Master gate: all conditions plus minimum confidence (eff_conf = 3 or 4)
+can_entry = entry_signal and not traded_today and confidence >= eff_conf
+
+// ── FIX 5: SIMPLE EMA CROSSOVER TEST ENTRY ───────────────────────────────────
+// Active only in backtest mode. No time-window restriction — fires throughout
+// the day to confirm the full execution pipeline (entry → stop/target → alerts)
+// works before applying the tighter Gap and Go filters.
+ema_cross      = ta.crossover(close, ema9)
+simple_signal  = backtest_mode and ema_cross and volume > avg_vol and
+                 rsi14 > 50 and above_vwap and no_position and not traded_today
+can_simple     = simple_signal and not can_entry   // don't double-enter same bar
 
 // ── SECTION 9: ENTRY EXECUTION ────────────────────────────────────────────────
 var int   entry_bar    = 0
@@ -170,14 +205,14 @@ var float entry_target = na
 var line  stop_line    = na
 var line  target_line  = na
 
+// Gap and Go primary entry
 if can_entry
     entry_stop   := stop_price
     entry_target := target_price
     entry_bar    := bar_index
     traded_today := true
-    strategy.entry("GapGo", strategy.long)
+    strategy.entry("GapGo", strategy.long, comment="GG")
     strategy.exit("GapGo Exit", "GapGo", stop=entry_stop, limit=entry_target)
-    // Draw stop and target levels
     if not na(stop_line)
         line.delete(stop_line)
     if not na(target_line)
@@ -187,22 +222,29 @@ if can_entry
     target_line := line.new(bar_index, entry_target, bar_index + 60, entry_target,
                             color=color.green, width=2, style=line.style_dashed)
 
+// FIX 5: Simple EMA test entry (backtest mode only)
+if can_simple
+    s_stop   = close - atr14 * atr_mult
+    s_target = close + (close - s_stop) * rr_input
+    entry_stop   := s_stop
+    entry_target := s_target
+    entry_bar    := bar_index
+    traded_today := true
+    strategy.entry("EMATest", strategy.long, comment="ET")
+    strategy.exit("EMATest Exit", "EMATest", stop=s_stop, limit=s_target)
+
 plotshape(can_entry,
-          style    = shape.triangleup,
-          location = location.belowbar,
-          color    = color.green,
-          size     = size.normal,
-          title    = "Gap and Go Entry")
+          style=shape.triangleup, location=location.belowbar,
+          color=color.green, size=size.normal, title="Gap and Go Entry")
+plotshape(can_simple,
+          style=shape.diamond, location=location.belowbar,
+          color=color.aqua, size=size.small, title="EMA Test Entry")
 
 // ── SECTION 10: TIME STOP ─────────────────────────────────────────────────────
-// Exit after 60 bars (= 60 minutes on 1m chart) to avoid holding through
-// mid-morning chop and momentum decay.
 if strategy.position_size > 0 and bar_index - entry_bar > 60
     strategy.close("Time Stop")
 
 // ── SECTION 11: VWAP STOP ─────────────────────────────────────────────────────
-// A close below VWAP after entry signals institutional selling pressure.
-// Exit immediately — the gap-and-go thesis has failed.
 if strategy.position_size > 0 and close < vwap
     strategy.close("VWAP Stop")
 
@@ -210,14 +252,28 @@ if strategy.position_size > 0 and close < vwap
 if can_entry
     alert(
      '{"action":"buy"' +
-     ',"symbol":"'      + syminfo.ticker + '"' +
-     ',"price":'        + str.tostring(close) +
-     ',"stop":'         + str.tostring(entry_stop) +
-     ',"target":'       + str.tostring(entry_target) +
-     ',"confidence":'   + str.tostring(confidence) +
-     ',"reason":"Gap and Go - gapped from previous close, broke pre-market high with volume surge above VWAP"' +
+     ',"symbol":"'       + syminfo.ticker + '"' +
+     ',"price":'         + str.tostring(close) +
+     ',"stop":'          + str.tostring(entry_stop) +
+     ',"target":'        + str.tostring(entry_target) +
+     ',"confidence":'    + str.tostring(confidence) +
+     ',"reason":"Gap and Go - broke ' + pmh_tag + ' with volume surge above VWAP"' +
      ',"session":"regular"' +
-     ',"change_pct":'   + str.tostring(math.round(gap_pct, 2)) +
+     ',"change_pct":'    + str.tostring(math.round(gap_pct, 2)) +
+     ',"relative_volume":' + str.tostring(math.round(rel_vol, 2)) + '}',
+     alert.freq_once_per_bar_close)
+
+if can_simple
+    alert(
+     '{"action":"buy"' +
+     ',"symbol":"'  + syminfo.ticker + '"' +
+     ',"price":'    + str.tostring(close) +
+     ',"stop":'     + str.tostring(entry_stop) +
+     ',"target":'   + str.tostring(entry_target) +
+     ',"confidence":' + str.tostring(confidence) +
+     ',"reason":"EMA test entry - backtest mode"' +
+     ',"session":"regular"' +
+     ',"change_pct":'    + str.tostring(math.round(gap_pct, 2)) +
      ',"relative_volume":' + str.tostring(math.round(rel_vol, 2)) + '}',
      alert.freq_once_per_bar_close)
 
@@ -230,53 +286,51 @@ if strategy.position_size[1] > 0 and strategy.position_size == 0
      alert.freq_once_per_bar_close)
 
 // ── SECTION 14: INFORMATION TABLE ────────────────────────────────────────────
-var table info_tbl = table.new(position.top_right, 2, 9,
-     bgcolor      = color.new(color.black, 70),
-     border_color = color.gray,
-     border_width = 1)
+var table info_tbl = table.new(position.top_right, 2, 10,
+     bgcolor=color.new(color.black, 70), border_color=color.gray, border_width=1)
 
 if barstate.islast
-    // Header
     table.cell(info_tbl, 0, 0, "PulseWebhook Pro",
                text_color=color.white, text_size=size.small,
                bgcolor=color.new(color.blue, 40))
-    table.cell(info_tbl, 1, 0, syminfo.ticker,
-               text_color=color.white, text_size=size.small,
-               bgcolor=color.new(color.blue, 40))
-    // Market Temperature
-    table.cell(info_tbl, 0, 1, "Temperature", text_color=color.white, text_size=size.small)
-    table.cell(info_tbl, 1, 1, temp_label,    text_color=temp_color,  text_size=size.small)
-    // Gap %
-    table.cell(info_tbl, 0, 2, "Gap %", text_color=color.white, text_size=size.small)
+    table.cell(info_tbl, 1, 0, backtest_mode ? "BACKTEST" : syminfo.ticker,
+               text_color=backtest_mode ? color.yellow : color.white,
+               text_size=size.small, bgcolor=color.new(color.blue, 40))
+    table.cell(info_tbl, 0, 1, "Temperature",  text_color=color.white, text_size=size.small)
+    table.cell(info_tbl, 1, 1, temp_label,     text_color=temp_color,  text_size=size.small)
+    table.cell(info_tbl, 0, 2, "Gap %",        text_color=color.white, text_size=size.small)
     table.cell(info_tbl, 1, 2, str.tostring(math.round(gap_pct, 2)) + "%",
-               text_color=gap_pct >= min_gap ? color.green : color.red, text_size=size.small)
-    // Pre-market High
-    table.cell(info_tbl, 0, 3, "Pre-Mkt High", text_color=color.white,  text_size=size.small)
-    table.cell(info_tbl, 1, 3, str.tostring(premarket_high, "#.##"),
+               text_color=gap_pct >= eff_gap ? color.green : color.red, text_size=size.small)
+    table.cell(info_tbl, 0, 3, pmh_tag,        text_color=color.white,  text_size=size.small)
+    table.cell(info_tbl, 1, 3, str.tostring(effective_pmh, "#.##"),
                text_color=color.orange, text_size=size.small)
-    // Volume Trend
     table.cell(info_tbl, 0, 4, "Volume Trend", text_color=color.white, text_size=size.small)
     table.cell(info_tbl, 1, 4, vol_trend,       text_color=vol_color,  text_size=size.small)
-    // Confidence Score
-    table.cell(info_tbl, 0, 5, "Confidence", text_color=color.white, text_size=size.small)
+    table.cell(info_tbl, 0, 5, "Confidence",   text_color=color.white, text_size=size.small)
     table.cell(info_tbl, 1, 5, str.tostring(confidence) + " / 6",
-               text_color=confidence >= 4 ? color.green : color.red, text_size=size.small)
-    // Relative Volume
-    table.cell(info_tbl, 0, 6, "Rel Volume", text_color=color.white, text_size=size.small)
+               text_color=confidence >= eff_conf ? color.green : color.red, text_size=size.small)
+    table.cell(info_tbl, 0, 6, "Rel Volume",   text_color=color.white, text_size=size.small)
     table.cell(info_tbl, 1, 6, str.tostring(math.round(rel_vol, 2)) + "x",
-               text_color=rel_vol >= min_rel_vol ? color.green : color.gray, text_size=size.small)
-    // Entry Window
+               text_color=rel_vol >= eff_vol ? color.green : color.gray, text_size=size.small)
     table.cell(info_tbl, 0, 7, "Entry Window", text_color=color.white, text_size=size.small)
     table.cell(info_tbl, 1, 7, in_entry_window ? "ACTIVE" : "CLOSED",
                text_color=in_entry_window ? color.lime : color.gray, text_size=size.small)
-    // Max Float (reference — applied externally via scanner)
-    table.cell(info_tbl, 0, 8, "Max Float",   text_color=color.white, text_size=size.small)
-    table.cell(info_tbl, 1, 8, str.tostring(max_float, "#.#") + "M",
+    table.cell(info_tbl, 0, 8, "Traded Today", text_color=color.white, text_size=size.small)
+    table.cell(info_tbl, 1, 8, traded_today ? "YES" : "NO",
+               text_color=traded_today ? color.red : color.green, text_size=size.small)
+    table.cell(info_tbl, 0, 9, "Max Float",    text_color=color.white, text_size=size.small)
+    table.cell(info_tbl, 1, 9, str.tostring(max_float, "#.#") + "M",
                text_color=color.gray, text_size=size.small)
+
+// ── FIX 4: DEBUG PLOTS ────────────────────────────────────────────────────────
+// Visible in TradingView Data Window and chart — use to diagnose why trades
+// are not firing. Check: is PMH tracking? Is gap_pct reaching the threshold?
+// Is confidence high enough? Is rel_vol meeting the floor?
+plot(effective_pmh, "PMH Debug",   color=color.orange, display=display.all)
+plot(gap_pct,       "Gap Debug",   color=color.yellow, display=display.all)
+plot(rel_vol,       "RelVol Debug",color=color.blue,   display=display.all)
+plot(confidence,    "Conf Debug",  color=color.white,  display=display.all)
 
 // ── Hidden series — referenced by alert placeholder syntax ────────────────────
 plot(entry_stop,   "stop_price",  display=display.none)
 plot(entry_target, "target_price",display=display.none)
-plot(confidence,   "confidence",  display=display.none)
-plot(gap_pct,      "gap_pct",     display=display.none)
-plot(rel_vol,      "rel_vol",     display=display.none)
