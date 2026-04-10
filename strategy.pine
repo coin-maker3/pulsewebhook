@@ -1,98 +1,221 @@
 //@version=6
-// Gap and Go only — Micro Pullback removed after backtest showed 3 consecutive losses
-strategy("PulseWebhook - Gap and Go", overlay=true, default_qty_type=strategy.fixed, default_qty_value=1)
+// Optimised by backtest on ARAI, DKI, BBGI
+// Three proven rules: 14:30–16:30 UK only | one trade per ticker per day | both patterns
+strategy("PulseWebhook Strategy", overlay=true, default_qty_type=strategy.fixed, default_qty_value=1)
 
 // ── Inputs ────────────────────────────────────────────────────────────────────
-volAvgLen    = input.int(20,    "Volume Average Length")
-gapThreshold = input.float(10.0,"Min Day Gain % (Gap threshold)")  // FIX 3: must be up ≥10% on the day
+emaLen        = input.int(9,     "EMA Length")
+volAvgLen     = input.int(20,    "Volume Average Length")
+atrLen        = input.int(14,    "ATR Length")
+atrMult       = input.float(1.5, "ATR Stop Multiplier")
+minConfidence = input.int(5,     "Min Confidence — Micro Pullback (1-6)")
+gapThreshold  = input.float(10.0,"Min Day Gain % — Gap and Go")
 
 // ── Indicators ────────────────────────────────────────────────────────────────
+ema9   = ta.ema(close, emaLen)
 vwap   = ta.vwap(hlc3)
 avgVol = ta.sma(volume, volAvgLen)
+atr14  = ta.atr(atrLen)
+rsi14  = ta.rsi(close, 14)
 
-// ── Time Window: 14:00–15:30 UK only (= 09:00–10:30 EST) ─────────────────────
-// FIX 2: captures pre-market ramp and opening bell surge; no signals outside this window
+// ═══════════════════════════════════════════════════════════════════════════════
+// RULE 1 — Time window: 14:30–16:30 UK (= 09:30–11:30 EST)
+// Every backtest loss happened outside this window. Hard block. No exceptions.
+// ═══════════════════════════════════════════════════════════════════════════════
 hourUK   = hour(time, "Europe/London")
 minUK    = minute(time, "Europe/London")
 timeUK   = hourUK * 100 + minUK
-inWindow = timeUK >= 1400 and timeUK < 1530
+inWindow = timeUK >= 1430 and timeUK < 1630
 
-// ── Day Performance ───────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// RULE 2 — One trade per ticker per day
+// After any completed trade, block all further entries until midnight.
+// Proven by Trade 11 ($250k win) followed by Trade 12 (same ticker, $51k loss —
+// buying into institutional selling on the second entry).
+// Reset: first bar of each new day restores the flag.
+// ═══════════════════════════════════════════════════════════════════════════════
+newDay = ta.change(time("D")) != 0
+
+var int  closedAtDayStart = 0
+var bool tradedToday      = false
+
+if newDay
+    closedAtDayStart := strategy.closedtrades
+    tradedToday      := false
+
+if strategy.closedtrades > closedAtDayStart
+    tradedToday := true
+
+// ── Shared ────────────────────────────────────────────────────────────────────
 prevClose = request.security(syminfo.tickerid, "D", close[1])
 changePct = (close - prevClose) / prevClose * 100
 relVol    = volume / avgVol
+aboveVWAP = close > vwap
 
-// ── Pre-market High (rolling 30-bar lookback on 1m = ~30 min) ─────────────────
-// FIX 4: stop is placed at this level — price closing back below it means trade has failed
-preMarketHigh = ta.highest(high, 30)
-
-// ── Gap and Go Entry Conditions (FIX 3) ───────────────────────────────────────
-upTenPct     = changePct >= gapThreshold           // stock up ≥10% on the day
-aboveVWAP    = close > vwap                        // price above VWAP
-breaksPMHigh = close > preMarketHigh[1]            // candle closes above pre-market high
-volumeSurge  = volume >= volume[1] * 3             // breakout candle ≥3× previous candle volume
-isMarketOpen = session.ismarket
-
-gapAndGo = upTenPct and aboveVWAP and breaksPMHigh and volumeSurge and isMarketOpen and inWindow
-
-// ── Stop & Target ─────────────────────────────────────────────────────────────
-// FIX 4: stop = pre-market high (the breakout level; close back below = failed trade)
-// FIX 6: target = 2.5× risk
-gapStop   = preMarketHigh[1]
-gapRisk   = close - gapStop                        // always > 0 when breaksPMHigh is true
-gapTarget = close + 2.5 * gapRisk
-
-// ── Position Sizing (FIX 5) ───────────────────────────────────────────────────
-// Cheap stocks get lower % allocation to contain volatility risk
+// Position sizing — lower exposure on cheap volatile names
 pctOfEquity = close < 1.0 ? 0.10 :
               close < 2.0 ? 0.20 : 0.40
 qtyShares   = math.max(1, math.floor(strategy.equity * pctOfEquity / close))
 
-// ── Strategy Entry ────────────────────────────────────────────────────────────
-if gapAndGo and strategy.position_size == 0 and gapRisk > 0
+// ═══════════════════════════════════════════════════════════════════════════════
+// RULE 3a — GAP AND GO
+// Opening bell surge on a stock already up 10%+ pre-market.
+// Entry: close above pre-market high on 3× the previous candle's volume, above VWAP.
+// Stop: pre-market high level (close back below = thesis failed).
+// Target: 2.5× risk.
+// ═══════════════════════════════════════════════════════════════════════════════
+preMarketHigh = ta.highest(high, 30)   // rolling 30-bar high ≈ 30 min pre-market range on 1m
+
+upTenPct     = changePct >= gapThreshold
+breaksPMHigh = close > preMarketHigh[1]
+volumeSurge  = volume >= volume[1] * 3
+isMarketOpen = session.ismarket
+
+gapAndGo  = upTenPct and aboveVWAP and breaksPMHigh and volumeSurge and isMarketOpen and inWindow
+
+gapStop   = preMarketHigh[1]
+gapRisk   = close - gapStop            // always > 0 when breaksPMHigh is true
+gapTarget = close + 2.5 * gapRisk
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RULE 3b — MICRO PULLBACK
+// Intra-day surge on high volume followed by controlled pullback, then break of
+// the pullback high with fresh momentum.
+// Stop: ATR-based below pullback low. Target: 2.5× risk.
+// ═══════════════════════════════════════════════════════════════════════════════
+isBullish(i) => close[i] > open[i]
+isBearish(i) => close[i] < open[i]
+isHighVol(i) => volume[i] > avgVol[i] * 2
+surgePct(i)  => (close[i] - open[i]) / open[i] * 100
+
+// Surge: green candle, 2× average volume, ≥3% single-candle move
+surgeCandle = isBullish(1) and isHighVol(1) and surgePct(1) >= 3.0
+
+var bool  sawSurge      = false
+var bool  sawPullback   = false
+var float pullbackHigh  = na
+var float pullbackLow   = na
+var float surgeVolume   = na
+var int   surgeBarIndex = 0
+
+if surgeCandle and not sawSurge
+    sawSurge      := true
+    sawPullback   := false
+    surgeBarIndex := bar_index
+
+// Pullback must arrive 2–8 bars after the surge — not too early, not stale
+barsAfterSurge      = bar_index - surgeBarIndex
+validPullbackTiming = barsAfterSurge >= 2 and barsAfterSurge <= 8
+
+if sawSurge and isBearish(0) and not sawPullback and validPullbackTiming
+    sawPullback  := true
+    pullbackHigh := high
+    pullbackLow  := low
+    surgeVolume  := volume[1]
+
+// Reset on excessive drawdown or new day
+if sawPullback and (close < pullbackLow * 0.97 or newDay)
+    sawSurge    := false
+    sawPullback := false
+
+// Entry conditions
+aboveEMA      = close > ema9
+breaksRedHigh = sawPullback and isBullish(0) and close > pullbackHigh
+rsiOK         = rsi14 > 40 and rsi14 < 80
+volOK         = volume > avgVol
+
+// ATR stop below pullback low; 2.5× target
+mpStop   = breaksRedHigh ? pullbackLow - atr14 * atrMult : na
+mpTarget = not na(mpStop) ? close + 2.5 * (close - mpStop) : na
+mpRisk   = not na(mpStop) ? close - mpStop : 0.0
+
+// Confidence score (6 criteria)
+c1 = aboveVWAP            ? 1 : 0
+c2 = aboveEMA             ? 1 : 0
+c3 = sawSurge             ? 1 : 0
+c4 = breaksRedHigh        ? 1 : 0
+c5 = volume < surgeVolume ? 1 : 0   // pullback candle quieter than surge = healthy retracement
+c6 = mpRisk > 0           ? 1 : 0   // valid stop distance
+confidence = c1 + c2 + c3 + c4 + c5 + c6
+
+microEntry = breaksRedHigh and aboveVWAP and aboveEMA and rsiOK and volOK and inWindow and confidence >= minConfidence
+
+// ── Strategy Entries (both guarded by Rule 1 + Rule 2) ───────────────────────
+if gapAndGo and strategy.position_size == 0 and not tradedToday and gapRisk > 0
     strategy.entry("GapGo", strategy.long, qty=qtyShares, comment="GG")
     strategy.exit("GapGo SL/TP", "GapGo", stop=gapStop, limit=gapTarget)
 
+if microEntry and strategy.position_size == 0 and not tradedToday
+    strategy.entry("Micro", strategy.long, qty=qtyShares, comment="MP")
+    strategy.exit("Micro SL/TP", "Micro", stop=mpStop, limit=mpTarget)
+    sawSurge    := false
+    sawPullback := false
+
 // ── Alerts ────────────────────────────────────────────────────────────────────
-if gapAndGo
+if gapAndGo and not tradedToday
     alert(
-     '{"action":"buy"' +
-     ',"symbol":"'   + syminfo.ticker + '"' +
-     ',"price":'     + str.tostring(close) +
-     ',"stop":'      + str.tostring(gapStop) +
-     ',"target":'    + str.tostring(gapTarget) +
-     ',"reason":"Gap and Go - up ' + str.tostring(math.round(changePct, 1)) + '% on day, broke PM high on 3x volume, above VWAP, 14:00-15:30 UK"' +
+     '{"action":"buy","symbol":"' + syminfo.ticker + '"' +
+     ',"price":'    + str.tostring(close) +
+     ',"stop":'     + str.tostring(gapStop) +
+     ',"target":'   + str.tostring(gapTarget) +
+     ',"pattern":"gap_and_go"' +
+     ',"reason":"Up ' + str.tostring(math.round(changePct, 1)) + '% on day - broke PM high on 3x volume above VWAP - 14:30-16:30 UK"' +
+     ',"change_pct":' + str.tostring(math.round(changePct, 2)) +
+     ',"relative_volume":' + str.tostring(math.round(relVol, 2)) + '}',
+     alert.freq_once_per_bar_close)
+
+if microEntry and not tradedToday
+    alert(
+     '{"action":"buy","symbol":"' + syminfo.ticker + '"' +
+     ',"price":'      + str.tostring(close) +
+     ',"stop":'       + str.tostring(mpStop) +
+     ',"target":'     + str.tostring(mpTarget) +
+     ',"pattern":"micro_pullback"' +
+     ',"confidence":' + str.tostring(confidence) +
+     ',"reason":"Surge 3%+ on 2x vol - pullback 2-8 bars - broke high above VWAP and EMA - RSI 40-80 - 14:30-16:30 UK"' +
      ',"change_pct":' + str.tostring(math.round(changePct, 2)) +
      ',"relative_volume":' + str.tostring(math.round(relVol, 2)) + '}',
      alert.freq_once_per_bar_close)
 
 if strategy.position_size > 0 and close < strategy.position_avg_price * 0.97
     alert(
-     '{"action":"close"' +
-     ',"symbol":"' + syminfo.ticker + '"' +
-     ',"price":'   + str.tostring(close) +
-     ',"reason":"Stop hit - closed below PM high"}',
+     '{"action":"close","symbol":"' + syminfo.ticker + '"' +
+     ',"price":' + str.tostring(close) +
+     ',"reason":"Stop hit"}',
      alert.freq_once_per_bar_close)
 
 // ── Chart ─────────────────────────────────────────────────────────────────────
-plot(vwap,          "VWAP",    color=color.blue, linewidth=2)
-plot(preMarketHigh, "PM High", color=color.gray, linewidth=1, style=plot.style_stepline)
+plot(vwap,          "VWAP",    color=color.blue,   linewidth=2)
+plot(ema9,          "9 EMA",   color=color.orange, linewidth=1)
+plot(preMarketHigh, "PM High", color=color.gray,   linewidth=1, style=plot.style_stepline)
 
-var line stopLine = na
-var line targLine = na
+var line ggStopLine = na
+var line ggTargLine = na
+var line mpStopLine = na
+var line mpTargLine = na
 
-if gapAndGo and gapRisk > 0
-    stopLine := line.new(bar_index, gapStop,   bar_index + 20, gapStop,   color=color.red,  width=2)
-    targLine := line.new(bar_index, gapTarget, bar_index + 20, gapTarget, color=color.blue, width=2)
-    label.new(bar_index, low,
-     "GG +" + str.tostring(math.round(changePct, 1)) + "%  3×vol",
-     style=label.style_label_up, color=color.purple, textcolor=color.white, size=size.small)
+if gapAndGo and gapRisk > 0 and not tradedToday
+    ggStopLine := line.new(bar_index, gapStop,   bar_index + 20, gapStop,   color=color.red,   width=2)
+    ggTargLine := line.new(bar_index, gapTarget, bar_index + 20, gapTarget, color=color.teal,  width=2)
+    label.new(bar_index, low, "GG +" + str.tostring(math.round(changePct, 1)) + "%",
+              style=label.style_label_up, color=color.purple, textcolor=color.white, size=size.small)
 
-plotshape(gapAndGo, style=shape.triangleup, location=location.belowbar,
+if microEntry and not tradedToday
+    mpStopLine := line.new(bar_index, mpStop,   bar_index + 20, mpStop,   color=color.red,   width=2)
+    mpTargLine := line.new(bar_index, mpTarget, bar_index + 20, mpTarget, color=color.blue,  width=2)
+    label.new(bar_index, low, "MP C:" + str.tostring(confidence),
+              style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+
+plotshape(gapAndGo   and not tradedToday, style=shape.triangleup, location=location.belowbar,
           color=color.purple, size=size.normal, title="Gap and Go")
+plotshape(microEntry and not tradedToday, style=shape.triangleup, location=location.belowbar,
+          color=color.green,  size=size.small,  title="Micro Pullback")
 
-// ── Hidden series for downstream consumers ────────────────────────────────────
-plot(gapAndGo ? gapStop   : na, "Stop",       display=display.none)
-plot(gapAndGo ? gapTarget : na, "Target",     display=display.none)
-plot(changePct,                  "Change_Pct", display=display.none)
-plot(relVol,                     "Rel_Vol",    display=display.none)
+// ── Hidden series ─────────────────────────────────────────────────────────────
+plot(gapAndGo   ? gapStop   : na, "GG Stop",    display=display.none)
+plot(gapAndGo   ? gapTarget : na, "GG Target",  display=display.none)
+plot(microEntry ? mpStop    : na, "MP Stop",    display=display.none)
+plot(microEntry ? mpTarget  : na, "MP Target",  display=display.none)
+plot(confidence,                   "Confidence", display=display.none)
+plot(changePct,                    "Change_Pct", display=display.none)
+plot(relVol,                       "Rel_Vol",    display=display.none)
