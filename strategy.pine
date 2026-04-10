@@ -1,0 +1,155 @@
+//@version=6
+strategy("PulseWebhook Strategy", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=5)
+
+// ── Inputs ────────────────────────────────────────────────────────────────────
+emaLen        = input.int(9,   "EMA Length")
+volAvgLen     = input.int(20,  "Volume Average Length")
+minConfidence = input.int(4,   "Min Confidence to Trade (1-6)")
+emaTolerance  = input.float(2.0, "EMA Tolerance %")
+gapThreshold  = input.float(5.0, "Gap-Up % Threshold")
+
+// ── Indicators ────────────────────────────────────────────────────────────────
+ema9  = ta.ema(close, emaLen)
+vwap  = ta.vwap(hlc3)
+avgVol = ta.sma(volume, volAvgLen)
+
+// ── Pattern Detection ─────────────────────────────────────────────────────────
+isBullish(i) => close[i] > open[i]
+isBearish(i) => close[i] < open[i]
+isHighVol(i) => volume[i] > avgVol[i] * 2
+
+// Surge: green candle with 2x average volume
+surgeCandle = isBullish(1) and isHighVol(1)
+
+// Pullback: first red candle after surge (current bar)
+pullbackCandle = isBearish(0) and surgeCandle
+
+// Detect the pattern state across bars
+var bool sawSurge     = false
+var bool sawPullback  = false
+var float pullbackHigh = na
+var float pullbackLow  = na
+var float surgeVolume  = na
+
+if surgeCandle and not sawSurge
+    sawSurge    := true
+    sawPullback := false
+
+if sawSurge and isBearish(0) and not sawPullback
+    sawPullback  := true
+    pullbackHigh := high
+    pullbackLow  := low
+    surgeVolume  := volume[1]
+
+// Reset if we get another surge or price drops too far
+if sawPullback and (close < pullbackLow * 0.97 or barstate.isnew and ta.change(time("D")) != 0)
+    sawSurge    := false
+    sawPullback := false
+
+// Entry trigger: green candle breaks above pullback high, above VWAP, near 9 EMA
+nearEMA = math.abs(close - ema9) / ema9 * 100 <= emaTolerance
+aboveVWAP = close > vwap
+breaksRedHigh = sawPullback and isBullish(0) and close > pullbackHigh
+
+// ── Confidence Score ──────────────────────────────────────────────────────────
+riskDist    = breaksRedHigh ? pullbackHigh - pullbackLow + 0.02 : na
+rewardDist  = breaksRedHigh ? (pullbackHigh + 2 * riskDist) - close : na
+rr          = (not na(riskDist) and riskDist > 0) ? rewardDist / riskDist : 0
+
+c1 = aboveVWAP                    ? 1 : 0
+c2 = nearEMA                      ? 1 : 0
+c3 = sawSurge                     ? 1 : 0
+c4 = breaksRedHigh                ? 1 : 0
+c5 = (volume < surgeVolume)       ? 1 : 0
+c6 = (rr >= 1.5)                  ? 1 : 0
+
+confidence = c1 + c2 + c3 + c4 + c5 + c6
+
+// ── Entry & Levels ────────────────────────────────────────────────────────────
+entryPrice = close
+stopPrice  = breaksRedHigh ? pullbackLow - 0.02 : na
+targetPrice = (not na(stopPrice)) ? entryPrice + 2 * (entryPrice - stopPrice) : na
+
+// ── Micro Pullback Signal ─────────────────────────────────────────────────────
+microEntry = breaksRedHigh and aboveVWAP and confidence >= minConfidence
+
+// ── Gap and Go Pattern ────────────────────────────────────────────────────────
+prevClose     = request.security(syminfo.tickerid, "D", close[1])
+gapPct        = (open - prevClose) / prevClose * 100
+isMarketOpen  = session.ismarket
+preMarketHigh = ta.highest(high, 30)  // approximate pre-market high
+gapAndGo      = gapPct >= gapThreshold and isMarketOpen and close > preMarketHigh[1] and volume > avgVol * 1.5
+
+// ── Derived plot values ───────────────────────────────────────────────────────
+changePct   = (close - prevClose) / prevClose * 100
+relVol      = volume / avgVol
+
+// ── Strategy Entries ──────────────────────────────────────────────────────────
+if microEntry and strategy.position_size == 0
+    strategy.entry("Micro", strategy.long, comment="MP")
+    strategy.exit("Micro SL/TP", "Micro", stop=stopPrice, limit=targetPrice)
+    sawSurge    := false
+    sawPullback := false
+
+if gapAndGo and strategy.position_size == 0
+    gapStop   = low * 0.98
+    gapTarget = close + 2 * (close - gapStop)
+    strategy.entry("GapGo", strategy.long, comment="GG")
+    strategy.exit("GapGo SL/TP", "GapGo", stop=gapStop, limit=gapTarget)
+
+// ── Stop Exit Alert ───────────────────────────────────────────────────────────
+closeCondition = strategy.position_size > 0 and close < strategy.position_avg_price * 0.97
+
+if closeCondition
+    alert('{"action":"close","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"reason":"Stop hit"}', alert.freq_once_per_bar_close)
+
+// ── Buy Alerts ────────────────────────────────────────────────────────────────
+alertMessage = '{"action":"buy","symbol":"' + syminfo.ticker +
+     '","price":' + str.tostring(close) +
+     ',"stop":' + str.tostring(stopPrice) +
+     ',"target":' + str.tostring(targetPrice) +
+     ',"confidence":' + str.tostring(confidence) +
+     ',"reason":"Micro pullback detected - surged on high volume, pulled back to support, green candle broke pullback high above VWAP"' +
+     ',"session":"' + (session.ispremarket ? "pre-market" : session.ispostmarket ? "after-hours" : "regular") + '"' +
+     ',"change_pct":' + str.tostring(math.round(changePct, 2)) +
+     ',"relative_volume":' + str.tostring(math.round(relVol, 2)) + '}'
+
+if microEntry
+    alert(alertMessage, alert.freq_once_per_bar_close)
+
+gapAlertMessage = '{"action":"buy","symbol":"' + syminfo.ticker +
+     '","price":' + str.tostring(close) +
+     ',"stop":' + str.tostring(low * 0.98) +
+     ',"target":' + str.tostring(close + 2 * (close - low * 0.98)) +
+     ',"confidence":5' +
+     ',"reason":"Gap and Go - gapped up ' + str.tostring(math.round(gapPct, 1)) + '% on high volume, broke pre-market high"' +
+     ',"session":"regular"' +
+     ',"change_pct":' + str.tostring(math.round(changePct, 2)) +
+     ',"relative_volume":' + str.tostring(math.round(relVol, 2)) + '}'
+
+if gapAndGo
+    alert(gapAlertMessage, alert.freq_once_per_bar_close)
+
+// ── Chart Drawings ────────────────────────────────────────────────────────────
+plot(vwap,  "VWAP",   color=color.blue,   linewidth=2)
+plot(ema9,  "9 EMA",  color=color.orange, linewidth=1)
+
+var line entryLine = na
+var line stopLine  = na
+var line targLine  = na
+
+if microEntry
+    entryLine := line.new(bar_index, entryPrice,  bar_index + 20, entryPrice,  color=color.green, width=2)
+    stopLine  := line.new(bar_index, stopPrice,   bar_index + 20, stopPrice,   color=color.red,   width=2)
+    targLine  := line.new(bar_index, targetPrice, bar_index + 20, targetPrice, color=color.blue,  width=2)
+    label.new(bar_index, low, "C:" + str.tostring(confidence), style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+
+plotshape(microEntry, style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, title="Micro Entry")
+plotshape(gapAndGo,   style=shape.triangleup, location=location.belowbar, color=color.purple, size=size.small, title="Gap and Go")
+
+// ── Hidden plots for alert placeholders ──────────────────────────────────────
+plot(stopPrice,   "Stop",       display=display.none)
+plot(targetPrice, "Target",     display=display.none)
+plot(confidence,  "Confidence", display=display.none)
+plot(changePct,   "Change_Pct", display=display.none)
+plot(relVol,      "Rel_Vol",    display=display.none)
