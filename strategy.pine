@@ -1,52 +1,76 @@
 //@version=6
 // ─────────────────────────────────────────────────────────────────────────────
-// Cameron Ross — Gap Pullback (VWAP Reclaim) Strategy
-// v5: VWAP Reclaim entry. After gap open, stock pulls back to VWAP. Buy the
-//     first candle that closes BACK above VWAP. Stop = candle low. 2.5R target.
+// Cameron Ross — Multi-Session Gap Strategy
+// v6: Three trading sessions. Pre-market and after-hours use rolling breakout
+//     entry (catches the big catalyst moves). Regular session uses VWAP reclaim
+//     (buys the pullback dip on strong gappers). $500 account. Webull (0% comm).
 // ─────────────────────────────────────────────────────────────────────────────
-// WHY THIS BEATS ORB
-//   ORB buys at the TOP of the opening range — extended, high risk.
-//   VWAP Reclaim buys at a VALUE zone after weak hands are shaken out.
-//   Stop is tighter (entry candle low vs ORB low which can be far away).
-//   Win rate documented at 65-72% on strong gappers (>15% gap, >3x volume).
+// SESSION ENTRIES
+//   PRE-MARKET  (default 06:00–09:25 EST)
+//     Entry:  Price makes new high vs last 10 bars with volume surge
+//     Logic:  Catalyst (news/PR) drives pre-market spike. Buy when the move
+//             extends above recent consolidation — not at random time.
+//     Stop:   Low of entry candle minus ATR buffer
+//
+//   REGULAR SESSION  (default 09:30–10:15 EST)
+//     Entry:  VWAP Reclaim — after pullback to VWAP, buy first close back above
+//     Logic:  Gap stocks pull back to VWAP early. Smart money buys there.
+//             65-72% documented win rate on stocks gapping >15%.
+//     Stop:   Low of entry candle minus ATR buffer
+//
+//   AFTER-HOURS  (default 16:00–19:30 EST)
+//     Entry:  Same rolling breakout as pre-market
+//     Logic:  Earnings/news after close. Buy the continuation, not the spike.
+//     Stop:   Low of entry candle minus ATR buffer
 //
 // HOW TO USE
-//   1. Open Webull at 9:15. Filter top gappers: >15% gap, low float (<10M),
-//      pre-market volume >500k. Pick the top 1-2 names.
-//   2. Load this script on a 1-minute TradingView chart for each stock.
-//   3. Watch the VWAP line (blue). When stock pulls back and touches it,
-//      get ready. Green triangle = confirmed VWAP reclaim entry signal.
-//   4. Entry fires automatically when all conditions pass.
-//   5. Stop (red dashed line) and target (green dashed line) shown on chart.
-//   6. One trade per day. Do NOT override the stop.
+//   1. Set TradingView chart to show extended hours:
+//      Right-click chart → Settings → Symbol → Session → Extended Trading Hours
+//   2. Use 1-minute chart
+//   3. Pre-screen on Webull: gap >15%, low float (<10M), pre-market vol >500k
+//   4. Green triangle = entry. Red dashed = stop. Green dashed = target.
+//   5. Max 2 trades per day. Never move your stop.
 //
-// ACCOUNT: $500 | COMMISSION: 0% (Webull) | RISK PER TRADE: 10% = $50
+// ACCOUNT: $500 | COMMISSION: 0% (Webull) | 10% per trade = $50
 // ─────────────────────────────────────────────────────────────────────────────
-strategy("Cameron Ross — Gap Pullback", overlay=true,
+strategy("Cameron Ross — Multi-Session", overlay=true,
      initial_capital    = 500,
      default_qty_type   = strategy.percent_of_equity,
      default_qty_value  = 10,
      commission_type    = strategy.commission.percent,
      commission_value   = 0.0,
-     slippage           = 2,
+     slippage           = 3,
      calc_on_every_tick = true)
 
 // ── SECTION 1: INPUTS ─────────────────────────────────────────────────────────
 backtest_mode = input.bool(true, "Backtest Mode (Lower Thresholds)",
      tooltip="ON: gap 8%, rel vol 1.5x, confidence 3. Turn OFF for live trading.")
 
-min_gap     = input.float(15.0, "Min Gap % (live)",      minval=0.0, step=1.0, group="Filters",
-     tooltip="Only trade stocks gapping >15%. Weaker gaps have ~45% win rate.")
-min_rel_vol = input.float(3.0,  "Min Rel Volume (live)", minval=0.1, step=0.1, group="Filters")
-rr_input    = input.float(2.5,  "Risk/Reward Target",    minval=0.5, step=0.1, group="Filters")
-atr_mult    = input.float(0.5,  "ATR Stop Buffer",       minval=0.1, step=0.1, group="Filters",
-     tooltip="Extra buffer below entry candle low for stop. 0.5 ATR default.")
+min_gap        = input.float(15.0, "Min Gap % (live)",      minval=0.0, step=1.0,  group="Filters")
+min_rel_vol    = input.float(3.0,  "Min Rel Volume (live)", minval=0.1, step=0.1,  group="Filters")
+rr_input       = input.float(2.5,  "Risk/Reward Target",    minval=0.5, step=0.1,  group="Filters")
+atr_mult       = input.float(0.5,  "ATR Stop Buffer",       minval=0.1, step=0.1,  group="Filters")
+max_daily      = input.int(2,      "Max Trades Per Day",    minval=1,   maxval=5,  group="Filters",
+     tooltip="Default 2: one extended-hours trade + one regular session trade.")
 
-ew_sh = input.int(9,  "Entry Start Hour EST",  minval=0, maxval=23, group="Time Window")
-ew_sm = input.int(30, "Entry Start Min EST",   minval=0, maxval=59, group="Time Window")
-ew_eh = input.int(10, "Entry End Hour EST",    minval=0, maxval=23, group="Time Window")
-ew_em = input.int(15, "Entry End Min EST",     minval=0, maxval=59, group="Time Window",
-     tooltip="Default 10:15 — VWAP reclaims after 10:15 have lower follow-through.")
+// Pre-market window
+pm_sh = input.int(6,  "Pre-Market Start Hour EST",  minval=0, maxval=23, group="Pre-Market Window")
+pm_sm = input.int(0,  "Pre-Market Start Min EST",   minval=0, maxval=59, group="Pre-Market Window")
+pm_eh = input.int(9,  "Pre-Market End Hour EST",    minval=0, maxval=23, group="Pre-Market Window")
+pm_em = input.int(25, "Pre-Market End Min EST",     minval=0, maxval=59, group="Pre-Market Window",
+     tooltip="Stops at 9:25 to avoid the chaotic 9:25-9:30 pre-open rush.")
+
+// Regular session window
+rs_sh = input.int(9,  "Regular Start Hour EST",     minval=0, maxval=23, group="Regular Session Window")
+rs_sm = input.int(30, "Regular Start Min EST",      minval=0, maxval=59, group="Regular Session Window")
+rs_eh = input.int(10, "Regular End Hour EST",       minval=0, maxval=23, group="Regular Session Window")
+rs_em = input.int(15, "Regular End Min EST",        minval=0, maxval=59, group="Regular Session Window")
+
+// After-hours window
+ah_sh = input.int(16, "After-Hours Start Hour EST", minval=0, maxval=23, group="After-Hours Window")
+ah_sm = input.int(0,  "After-Hours Start Min EST",  minval=0, maxval=59, group="After-Hours Window")
+ah_eh = input.int(19, "After-Hours End Hour EST",   minval=0, maxval=23, group="After-Hours Window")
+ah_em = input.int(30, "After-Hours End Min EST",    minval=0, maxval=59, group="After-Hours Window")
 
 eff_gap  = backtest_mode ? 8.0 : min_gap
 eff_vol  = backtest_mode ? 1.5 : min_rel_vol
@@ -58,7 +82,20 @@ minute_est = minute(time, "America/New_York")
 time_est   = hour_est * 100 + minute_est
 new_day    = not na(dayofweek[1]) and dayofweek != dayofweek[1]
 
-// ── SECTION 2: INDICATORS (declared early — used throughout) ─────────────────
+// Session detection
+pm_start        = pm_sh * 100 + pm_sm
+pm_end          = pm_eh * 100 + pm_em
+rs_start        = rs_sh * 100 + rs_sm
+rs_end          = rs_eh * 100 + rs_em
+ah_start        = ah_sh * 100 + ah_sm
+ah_end          = ah_eh * 100 + ah_em
+
+in_premarket    = time_est >= pm_start and time_est < pm_end
+in_regular      = time_est >= rs_start and time_est < rs_end
+in_afterhours   = time_est >= ah_start and time_est < ah_end
+in_any_window   = in_premarket or in_regular or in_afterhours
+
+// ── SECTION 2: INDICATORS ─────────────────────────────────────────────────────
 atr14 = ta.atr(14)
 vwap  = ta.vwap(hlc3)
 ema9  = ta.ema(close, 9)
@@ -103,7 +140,6 @@ var label pmh_lbl        = na
 if new_day
     premarket_high := 0.0
 
-in_premarket = hour_est < 9 or (hour_est == 9 and minute_est < 30)
 if in_premarket
     premarket_high := math.max(premarket_high, high)
 
@@ -132,6 +168,7 @@ if barstate.islast and effective_pmh > 0
 
 // ── SECTION 5: VOLUME ─────────────────────────────────────────────────────────
 avg_vol      = ta.sma(volume, 20)
+avg_vol_10   = ta.sma(volume, 10)   // shorter average for extended-hours volume
 rel_vol      = avg_vol > 0 ? volume / avg_vol : 0.0
 recent_vol   = volume    + volume[1] + volume[2]
 earlier_vol  = volume[4] + volume[5] + volume[6]
@@ -162,76 +199,73 @@ if first_bar
         0.0
     first_bar := false
 
-// ── SECTION 7: VWAP RECLAIM ENTRY LOGIC ──────────────────────────────────────
-// Step 1: Track when price has touched or crossed below VWAP during the session.
-//         This is the "pullback" — weak hands being shaken out.
-// Step 2: Entry fires on the FIRST candle that closes back above VWAP after
-//         that pullback. This is the "reclaim" — smart money stepping back in.
-// Stop:   Low of the entry candle minus ATR buffer. Tight, defined risk.
+// ── SECTION 7: ENTRY LOGIC ────────────────────────────────────────────────────
 
+// --- REGULAR SESSION: VWAP Reclaim ---
+// After gap open, price pulls back to VWAP, then reclaims it.
 var bool touched_vwap = false
 if new_day
     touched_vwap := false
-
-// Mark pullback once price dips to or below VWAP after market open
-if time_est >= 930 and close <= vwap
+if in_regular and close <= vwap
     touched_vwap := true
 
-// Reclaim = close crosses above VWAP after having touched it
-vwap_reclaim = touched_vwap and close > vwap and close[1] <= vwap
+vwap_reclaim = touched_vwap and in_regular and close > vwap and close[1] <= vwap
 
-// ── SECTION 8: ALL ENTRY CONDITIONS ──────────────────────────────────────────
-start_time      = ew_sh * 100 + ew_sm
-end_time        = ew_eh * 100 + ew_em
-in_entry_window = time_est >= start_time and time_est < end_time
+// --- EXTENDED HOURS: Rolling High Breakout ---
+// Price makes a new high vs the last 10 bars — momentum continuation.
+// Uses shorter volume average (10-bar) since regular-session avg inflates the bar.
+highest_10    = ta.highest(high, 10)
+rolling_break = close > highest_10[1] and close > open
+ext_vol_ok    = volume > avg_vol_10 * eff_vol
 
-volume_surge = volume > avg_vol * eff_vol
-above_ema9   = close > ema9
-rsi_ok       = rsi14 > 35 and rsi14 < 75
-gap_ok       = gap_pct >= eff_gap
-no_position  = strategy.position_size == 0
+ext_breakout  = (in_premarket or in_afterhours) and rolling_break and ext_vol_ok
 
-// ── SECTION 9: ONE TRADE PER DAY ─────────────────────────────────────────────
-var bool traded_today = false
-if new_day
-    traded_today := false
+// ── SECTION 8: SHARED FILTERS AND CONFIDENCE ─────────────────────────────────
+rsi_ok      = rsi14 > 35 and rsi14 < 80
+gap_ok      = gap_pct >= eff_gap
+no_position = strategy.position_size == 0
 
-// ── SECTION 10: CONFIDENCE SCORE (1–6) ───────────────────────────────────────
-c1 = close > vwap                ? 1 : 0   // above VWAP
-c2 = close > ema9                ? 1 : 0   // above 9 EMA
-c3 = volume > avg_vol * 3        ? 1 : 0   // 3× average volume
-c4 = gap_pct > 15                ? 1 : 0   // strong gap
-c5 = HOT or SCORCHING            ? 1 : 0   // hot market
-c6 = rsi14 >= 45 and rsi14 <= 70 ? 1 : 0   // RSI in range
+c1 = close > vwap                ? 1 : 0
+c2 = close > ema9                ? 1 : 0
+c3 = volume > avg_vol * 3        ? 1 : 0
+c4 = gap_pct > 15                ? 1 : 0
+c5 = HOT or SCORCHING            ? 1 : 0
+c6 = rsi14 >= 40 and rsi14 <= 75 ? 1 : 0
 confidence = c1 + c2 + c3 + c4 + c5 + c6
 
-// Primary entry: VWAP reclaim with all filters
-entry_signal = in_entry_window and vwap_reclaim and volume_surge and above_ema9 and rsi_ok and gap_ok and temp_ok and no_position
-can_entry    = entry_signal and not traded_today and confidence >= eff_conf
+// ── SECTION 9: TRADE COUNTER (replaces traded_today boolean) ─────────────────
+var int trades_today = 0
+if new_day
+    trades_today := 0
 
-// Backtest pipeline test: EMA crossover (no time window, fires throughout day)
-ema_cross     = ta.crossover(close, ema9)
-simple_signal = backtest_mode and ema_cross and volume > avg_vol and rsi14 > 50 and close > vwap and no_position and not traded_today
-can_simple    = simple_signal and not can_entry
+can_take_trade = no_position and trades_today < max_daily
 
-// ── SECTION 11: ENTRY EXECUTION ───────────────────────────────────────────────
+// Final entry gates
+can_regular = vwap_reclaim and rsi_ok and gap_ok and temp_ok and volume > avg_vol * eff_vol and close > ema9 and can_take_trade and confidence >= eff_conf
+can_ext     = ext_breakout and rsi_ok and gap_ok and temp_ok and can_take_trade and confidence >= eff_conf
+
+// Backtest pipeline test entry
+ema_cross      = ta.crossover(close, ema9)
+can_simple     = backtest_mode and ema_cross and volume > avg_vol and rsi14 > 50 and close > vwap and can_take_trade and not can_regular and not can_ext
+
+// ── SECTION 10: ENTRY EXECUTION ───────────────────────────────────────────────
 var int   entry_bar    = 0
 var float entry_stop   = na
 var float entry_target = na
 var line  stop_line    = na
 var line  target_line  = na
 
-// VWAP Reclaim primary entry
-if can_entry
+// Regular session — VWAP Reclaim entry
+if can_regular
     stop_px  = low - atr14 * atr_mult
     risk_pts = close - stop_px
     tgt      = close + risk_pts * rr_input
     entry_stop   := stop_px
     entry_target := tgt
     entry_bar    := bar_index
-    traded_today := true
-    strategy.entry("GapPullback", strategy.long, comment="VP")
-    strategy.exit("GP Exit", "GapPullback", stop=entry_stop, limit=entry_target)
+    trades_today += 1
+    strategy.entry("Regular", strategy.long, comment="VR")
+    strategy.exit("Reg Exit", "Regular", stop=entry_stop, limit=entry_target)
     if not na(stop_line)
         line.delete(stop_line)
     if not na(target_line)
@@ -239,70 +273,109 @@ if can_entry
     stop_line   := line.new(bar_index, entry_stop,   bar_index + 60, entry_stop,   color=color.red,   width=2, style=line.style_dashed)
     target_line := line.new(bar_index, entry_target, bar_index + 60, entry_target, color=color.green, width=2, style=line.style_dashed)
 
-// EMA test entry (backtest only)
+// Extended hours — Rolling Breakout entry
+if can_ext
+    stop_px  = low - atr14 * atr_mult
+    risk_pts = close - stop_px
+    tgt      = close + risk_pts * rr_input
+    entry_stop   := stop_px
+    entry_target := tgt
+    entry_bar    := bar_index
+    trades_today += 1
+    strategy.entry("Extended", strategy.long, comment="EXT")
+    strategy.exit("Ext Exit", "Extended", stop=entry_stop, limit=entry_target)
+    if not na(stop_line)
+        line.delete(stop_line)
+    if not na(target_line)
+        line.delete(target_line)
+    stop_line   := line.new(bar_index, entry_stop,   bar_index + 60, entry_stop,   color=color.red,   width=2, style=line.style_dashed)
+    target_line := line.new(bar_index, entry_target, bar_index + 60, entry_target, color=color.green, width=2, style=line.style_dashed)
+
+// Backtest EMA test entry
 if can_simple
     s_stop   = close - atr14 * atr_mult
     s_target = close + (close - s_stop) * rr_input
     entry_stop   := s_stop
     entry_target := s_target
     entry_bar    := bar_index
-    traded_today := true
+    trades_today += 1
     strategy.entry("EMATest", strategy.long, comment="ET")
     strategy.exit("EMATest Exit", "EMATest", stop=s_stop, limit=s_target)
 
-plotshape(can_entry,  style=shape.triangleup, location=location.belowbar, color=color.green, size=size.normal, title="VWAP Reclaim Entry")
-plotshape(can_simple, style=shape.diamond,    location=location.belowbar, color=color.aqua,  size=size.small,  title="EMA Test Entry")
+plotshape(can_regular, style=shape.triangleup, location=location.belowbar, color=color.green,  size=size.normal, title="VWAP Reclaim (Regular)")
+plotshape(can_ext,     style=shape.triangleup, location=location.belowbar, color=color.yellow, size=size.normal, title="Breakout (Extended Hours)")
+plotshape(can_simple,  style=shape.diamond,    location=location.belowbar, color=color.aqua,   size=size.small,  title="EMA Test")
 
-// ── SECTION 12: EXITS ─────────────────────────────────────────────────────────
-// Time stop: close after 60 bars (60 min on 1m chart)
+// ── SECTION 11: EXITS ─────────────────────────────────────────────────────────
 if strategy.position_size > 0 and bar_index - entry_bar > 60
     strategy.close("Time Stop")
 
-// VWAP stop: close drops back below VWAP while in position
-if strategy.position_size > 0 and close < vwap
+if strategy.position_size > 0 and in_regular and close < vwap
     strategy.close("VWAP Stop")
 
-// ── SECTION 13: ALERTS ────────────────────────────────────────────────────────
-if can_entry
-    alert('{"action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(entry_stop) + ',"target":' + str.tostring(entry_target) + ',"confidence":' + str.tostring(confidence) + ',"reason":"VWAP reclaim after pullback","change_pct":' + str.tostring(math.round(gap_pct, 2)) + ',"relative_volume":' + str.tostring(math.round(rel_vol, 2)) + '}', alert.freq_once_per_bar_close)
+// ── SECTION 12: ALERTS ────────────────────────────────────────────────────────
+if can_regular
+    alert('{"action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(entry_stop) + ',"target":' + str.tostring(entry_target) + ',"confidence":' + str.tostring(confidence) + ',"reason":"VWAP reclaim - regular session","session":"regular","change_pct":' + str.tostring(math.round(gap_pct, 2)) + ',"relative_volume":' + str.tostring(math.round(rel_vol, 2)) + '}', alert.freq_once_per_bar_close)
+
+if can_ext
+    session_name = in_premarket ? "pre-market" : "after-hours"
+    alert('{"action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(entry_stop) + ',"target":' + str.tostring(entry_target) + ',"confidence":' + str.tostring(confidence) + ',"reason":"Rolling breakout - ' + session_name + '","session":"' + session_name + '","change_pct":' + str.tostring(math.round(gap_pct, 2)) + ',"relative_volume":' + str.tostring(math.round(rel_vol, 2)) + '}', alert.freq_once_per_bar_close)
 
 if can_simple
-    alert('{"action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(entry_stop) + ',"target":' + str.tostring(entry_target) + ',"confidence":' + str.tostring(confidence) + ',"reason":"EMA test entry - backtest","change_pct":' + str.tostring(math.round(gap_pct, 2)) + ',"relative_volume":' + str.tostring(math.round(rel_vol, 2)) + '}', alert.freq_once_per_bar_close)
+    alert('{"action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(entry_stop) + ',"target":' + str.tostring(entry_target) + ',"confidence":' + str.tostring(confidence) + ',"reason":"EMA test - backtest","session":"regular","change_pct":' + str.tostring(math.round(gap_pct, 2)) + ',"relative_volume":' + str.tostring(math.round(rel_vol, 2)) + '}', alert.freq_once_per_bar_close)
 
 if strategy.position_size[1] > 0 and strategy.position_size == 0
     alert('{"action":"close","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"reason":"exit triggered"}', alert.freq_once_per_bar_close)
 
-// ── SECTION 14: INFO TABLE ────────────────────────────────────────────────────
-var table info_tbl = table.new(position.top_right, 2, 11,
+// ── SECTION 13: INFO TABLE ────────────────────────────────────────────────────
+var table info_tbl = table.new(position.top_right, 2, 12,
      bgcolor=color.new(color.black, 70), border_color=color.gray, border_width=1)
 
-if barstate.islast
-    table.cell(info_tbl, 0, 0,  "Cameron Ross",  text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 40))
-    table.cell(info_tbl, 1, 0,  backtest_mode ? "BACKTEST" : "$500 LIVE", text_color=backtest_mode ? color.yellow : color.lime, text_size=size.small, bgcolor=color.new(color.purple, 40))
-    table.cell(info_tbl, 0, 1,  "Temperature",   text_color=color.white, text_size=size.small)
-    table.cell(info_tbl, 1, 1,  temp_label,      text_color=temp_color,  text_size=size.small)
-    table.cell(info_tbl, 0, 2,  "Gap %",         text_color=color.white, text_size=size.small)
-    table.cell(info_tbl, 1, 2,  str.tostring(math.round(gap_pct, 2)) + "%", text_color=gap_pct >= eff_gap ? color.green : color.red, text_size=size.small)
-    table.cell(info_tbl, 0, 3,  pmh_tag,         text_color=color.white, text_size=size.small)
-    table.cell(info_tbl, 1, 3,  str.tostring(effective_pmh, "#.##"), text_color=color.orange, text_size=size.small)
-    table.cell(info_tbl, 0, 4,  "VWAP Reclaim",  text_color=color.white, text_size=size.small)
-    table.cell(info_tbl, 1, 4,  touched_vwap ? "READY — watching for reclaim" : "Waiting for pullback", text_color=touched_vwap ? color.lime : color.gray, text_size=size.small)
-    table.cell(info_tbl, 0, 5,  "VWAP",          text_color=color.white, text_size=size.small)
-    table.cell(info_tbl, 1, 5,  str.tostring(vwap, "#.##"), text_color=color.blue, text_size=size.small)
-    table.cell(info_tbl, 0, 6,  "Volume Trend",  text_color=color.white, text_size=size.small)
-    table.cell(info_tbl, 1, 6,  vol_trend,       text_color=vol_color,   text_size=size.small)
-    table.cell(info_tbl, 0, 7,  "Confidence",    text_color=color.white, text_size=size.small)
-    table.cell(info_tbl, 1, 7,  str.tostring(confidence) + " / 6", text_color=confidence >= eff_conf ? color.green : color.red, text_size=size.small)
-    table.cell(info_tbl, 0, 8,  "Rel Volume",    text_color=color.white, text_size=size.small)
-    table.cell(info_tbl, 1, 8,  str.tostring(math.round(rel_vol, 2)) + "x", text_color=rel_vol >= eff_vol ? color.green : color.gray, text_size=size.small)
-    table.cell(info_tbl, 0, 9,  "Entry Window",  text_color=color.white, text_size=size.small)
-    table.cell(info_tbl, 1, 9,  in_entry_window ? "ACTIVE" : "CLOSED", text_color=in_entry_window ? color.lime : color.gray, text_size=size.small)
-    table.cell(info_tbl, 0, 10, "Traded Today",  text_color=color.white, text_size=size.small)
-    table.cell(info_tbl, 1, 10, traded_today ? "YES — done for the day" : "NO", text_color=traded_today ? color.red : color.green, text_size=size.small)
+current_session = if in_premarket
+    "PRE-MARKET"
+else if in_regular
+    "REGULAR"
+else if in_afterhours
+    "AFTER-HOURS"
+else
+    "CLOSED"
 
-// ── DEBUG VALUES (Data Window only — not plotted on price chart) ──────────────
-// Hover over any bar in TradingView to see these in the Data Window panel.
-// They are hidden from the chart so they don't cover your candles.
+session_color = if in_premarket
+    color.yellow
+else if in_regular
+    color.lime
+else if in_afterhours
+    color.orange
+else
+    color.gray
+
+if barstate.islast
+    table.cell(info_tbl, 0, 0,  "Cameron Ross",   text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 40))
+    table.cell(info_tbl, 1, 0,  backtest_mode ? "BACKTEST" : "$500 LIVE", text_color=backtest_mode ? color.yellow : color.lime, text_size=size.small, bgcolor=color.new(color.purple, 40))
+    table.cell(info_tbl, 0, 1,  "Session",         text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 1, 1,  current_session,   text_color=session_color, text_size=size.small)
+    table.cell(info_tbl, 0, 2,  "Temperature",     text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 1, 2,  temp_label,        text_color=temp_color,    text_size=size.small)
+    table.cell(info_tbl, 0, 3,  "Gap %",           text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 1, 3,  str.tostring(math.round(gap_pct, 2)) + "%", text_color=gap_pct >= eff_gap ? color.green : color.red, text_size=size.small)
+    table.cell(info_tbl, 0, 4,  pmh_tag,           text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 1, 4,  str.tostring(effective_pmh, "#.##"), text_color=color.orange, text_size=size.small)
+    table.cell(info_tbl, 0, 5,  "VWAP",            text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 1, 5,  str.tostring(vwap, "#.##"), text_color=color.blue, text_size=size.small)
+    table.cell(info_tbl, 0, 6,  "VWAP Reclaim",    text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 1, 6,  touched_vwap ? "READY" : "Waiting", text_color=touched_vwap ? color.lime : color.gray, text_size=size.small)
+    table.cell(info_tbl, 0, 7,  "Volume Trend",    text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 1, 7,  vol_trend,         text_color=vol_color,     text_size=size.small)
+    table.cell(info_tbl, 0, 8,  "Confidence",      text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 1, 8,  str.tostring(confidence) + " / 6", text_color=confidence >= eff_conf ? color.green : color.red, text_size=size.small)
+    table.cell(info_tbl, 0, 9,  "Rel Volume",      text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 1, 9,  str.tostring(math.round(rel_vol, 2)) + "x", text_color=rel_vol >= eff_vol ? color.green : color.gray, text_size=size.small)
+    table.cell(info_tbl, 0, 10, "Trades Today",    text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 1, 10, str.tostring(trades_today) + " / " + str.tostring(max_daily), text_color=trades_today >= max_daily ? color.red : color.green, text_size=size.small)
+    table.cell(info_tbl, 0, 11, "Entry Window",    text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 1, 11, in_any_window ? "ACTIVE" : "CLOSED", text_color=in_any_window ? color.lime : color.gray, text_size=size.small)
+
+// ── DEBUG VALUES (Data Window only — hover over any bar to see) ───────────────
 plot(effective_pmh, "PMH Debug",    color=color.orange, display=display.data_window)
 plot(gap_pct,       "Gap Debug",    color=color.yellow, display=display.data_window)
 plot(rel_vol,       "RelVol Debug", color=color.blue,   display=display.data_window)
