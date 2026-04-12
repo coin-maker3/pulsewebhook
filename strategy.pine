@@ -207,7 +207,7 @@ gap_ok        = gap_pct >= eff_gap
 above_ema     = close > ema9                              // trend intact
 no_position   = strategy.position_size == 0
 
-can_entry = in_date_range and in_any_window and breakout and vol_surge and rsi_ok and gap_ok and temp_ok and above_ema and no_position
+can_entry = in_date_range and breakout and vol_surge and gap_ok and no_position
 
 // ── ENTRY EXECUTION ──────────────────────────────────────────────────────────
 var int   entry_bar    = 0
@@ -269,9 +269,7 @@ if strategy.position_size > 0
 if strategy.position_size > 0 and bar_index - entry_bar > time_stop
     strategy.close("Time Stop")
 
-// VWAP stop — only in regular session (extended hours VWAP is unreliable)
-if strategy.position_size > 0 and in_regular and close < vwap and close < ema9
-    strategy.close("VWAP Stop")
+// (no session-based stops — trailing stop handles exits)
 
 // Reset tracking vars on flat
 if strategy.position_size == 0 and strategy.position_size[1] > 0
