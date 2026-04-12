@@ -1,39 +1,30 @@
 //@version=6
 // ─────────────────────────────────────────────────────────────────────────────
-// Cameron Ross — Multi-Session Gap Strategy
-// v6: Three trading sessions. Pre-market and after-hours use rolling breakout
-//     entry (catches the big catalyst moves). Regular session uses VWAP reclaim
-//     (buys the pullback dip on strong gappers). $500 account. Webull (0% comm).
+// PulseWebhook — Momentum Breakout | All Sessions
+// Trades pre-market, regular, and after-hours. No daily trade cap.
+// Trailing stop lets winners run. Re-entry allowed after exit.
+// $500 account. Webull (0% commission).
 // ─────────────────────────────────────────────────────────────────────────────
-// SESSION ENTRIES
-//   PRE-MARKET  (default 06:00–09:25 EST)
-//     Entry:  Price makes new high vs last 10 bars with volume surge
-//     Logic:  Catalyst (news/PR) drives pre-market spike. Buy when the move
-//             extends above recent consolidation — not at random time.
-//     Stop:   Low of entry candle minus ATR buffer
+// ENTRY (same logic all sessions):
+//   Price breaks above highest high of last 10 bars (momentum continuation)
+//   + Volume surge (2x average)
+//   + RSI 30–80 (not exhausted, not dead)
+//   + Gap day (stock is gapping)
 //
-//   REGULAR SESSION  (default 09:30–10:15 EST)
-//     Entry:  VWAP Reclaim — after pullback to VWAP, buy first close back above
-//     Logic:  Gap stocks pull back to VWAP early. Smart money buys there.
-//             65-72% documented win rate on stocks gapping >15%.
-//     Stop:   Low of entry candle minus ATR buffer
+// EXIT:
+//   Hard stop: Low of entry bar minus ATR buffer (thesis broken)
+//   Trailing stop: Activates after 1R profit, trails 1.5 ATR below highest high
+//   Time stop: 120 bars (2 hours on 1m) — move on if nothing happened
+//   VWAP stop: Close below VWAP in regular session = momentum lost
 //
-//   AFTER-HOURS  (default 16:00–19:30 EST)
-//     Entry:  Same rolling breakout as pre-market
-//     Logic:  Earnings/news after close. Buy the continuation, not the spike.
-//     Stop:   Low of entry candle minus ATR buffer
-//
-// HOW TO USE
-//   1. Set TradingView chart to show extended hours:
-//      Right-click chart → Settings → Symbol → Session → Extended Trading Hours
-//   2. Use 1-minute chart
-//   3. Pre-screen on Webull: gap >15%, low float (<10M), pre-market vol >500k
-//   4. Green triangle = entry. Red dashed = stop. Green dashed = target.
-//   5. Max 2 trades per day. Never move your stop.
-//
-// ACCOUNT: $500 | COMMISSION: 0% (Webull) | 10% per trade = $50
+// HOW TO USE:
+//   1. Extended hours ON in TradingView chart settings
+//   2. 1-minute chart
+//   3. Pre-screen: gap >10%, low float, pre-market volume
+//   4. Green triangle = entry. Red line = stop. Trailing stop moves up.
+//   5. Let the trailing stop do its job. Never move your stop DOWN.
 // ─────────────────────────────────────────────────────────────────────────────
-strategy("Cameron Ross — Multi-Session", overlay=true,
+strategy("PulseWebhook — Momentum", overlay=true,
      initial_capital    = 500,
      default_qty_type   = strategy.percent_of_equity,
      default_qty_value  = 10,
@@ -42,80 +33,77 @@ strategy("Cameron Ross — Multi-Session", overlay=true,
      slippage           = 3,
      calc_on_every_tick = true)
 
-// ── SECTION 1: INPUTS ─────────────────────────────────────────────────────────
-backtest_mode = input.bool(true, "Backtest Mode (Lower Thresholds)",
-     tooltip="ON: gap 8%, rel vol 1.5x, confidence 3. Turn OFF for live trading.")
+// ── INPUTS ───────────────────────────────────────────────────────────────────
+backtest_mode = input.bool(true, "Backtest Mode",
+     tooltip="ON: lower thresholds for historical testing. OFF: live thresholds.")
 
-// Set this to the day the stock first appeared on your scanner / started gapping.
-// The strategy will ignore all bars before this date so flat history is excluded.
 start_date = input.time(timestamp("2024-01-01 00:00"), "Backtest Start Date",
-     tooltip="Set to the day the stock hit your Webull scanner. Ignores all flat history before this date.", group="Backtest Range")
+     tooltip="Set to the day the stock gapped. Ignores flat history before.", group="Backtest Range")
 end_date   = input.time(timestamp("2099-12-31 00:00"), "Backtest End Date",
-     tooltip="Leave at default to run to present. Set to limit the test window.", group="Backtest Range")
+     tooltip="Leave default to run to present.", group="Backtest Range")
 
 in_date_range = time >= start_date and time <= end_date
 
-min_gap        = input.float(15.0, "Min Gap % (live)",      minval=0.0, step=1.0,  group="Filters")
-min_rel_vol    = input.float(3.0,  "Min Rel Volume (live)", minval=0.1, step=0.1,  group="Filters")
-rr_input       = input.float(2.5,  "Risk/Reward Target",    minval=0.5, step=0.1,  group="Filters")
-atr_mult       = input.float(0.5,  "ATR Stop Buffer",       minval=0.1, step=0.1,  group="Filters")
-max_daily      = input.int(2,      "Max Trades Per Day",    minval=1,   maxval=5,  group="Filters",
-     tooltip="Default 2: one extended-hours trade + one regular session trade.")
+min_gap      = input.float(10.0, "Min Gap % (live)",        minval=0.0, step=1.0,  group="Filters")
+min_rel_vol  = input.float(2.0,  "Min Rel Volume (live)",   minval=0.1, step=0.1,  group="Filters")
+atr_mult     = input.float(0.5,  "ATR Stop Buffer",         minval=0.1, step=0.1,  group="Filters")
+trail_atr    = input.float(1.5,  "Trailing Stop ATR Mult",  minval=0.5, step=0.1,  group="Filters",
+     tooltip="Trailing stop distance below highest high since entry. Lower = tighter trail.")
+breakout_len = input.int(10,     "Breakout Lookback Bars",   minval=3,   maxval=30, group="Filters")
+time_stop    = input.int(120,    "Time Stop (bars)",         minval=20,  maxval=300, group="Filters",
+     tooltip="Close position if no move after this many bars.")
 
-// Pre-market window
-pm_sh = input.int(6,  "Pre-Market Start Hour EST",  minval=0, maxval=23, group="Pre-Market Window")
-pm_sm = input.int(0,  "Pre-Market Start Min EST",   minval=0, maxval=59, group="Pre-Market Window")
-pm_eh = input.int(9,  "Pre-Market End Hour EST",    minval=0, maxval=23, group="Pre-Market Window")
-pm_em = input.int(25, "Pre-Market End Min EST",     minval=0, maxval=59, group="Pre-Market Window",
-     tooltip="Stops at 9:25 to avoid the chaotic 9:25-9:30 pre-open rush.")
+// Session windows
+pm_sh = input.int(6,  "Pre-Market Start Hour EST",  minval=0, maxval=23, group="Pre-Market")
+pm_sm = input.int(0,  "Pre-Market Start Min",       minval=0, maxval=59, group="Pre-Market")
+pm_eh = input.int(9,  "Pre-Market End Hour EST",    minval=0, maxval=23, group="Pre-Market")
+pm_em = input.int(25, "Pre-Market End Min",          minval=0, maxval=59, group="Pre-Market")
 
-// Regular session window
-rs_sh = input.int(9,  "Regular Start Hour EST",     minval=0, maxval=23, group="Regular Session Window")
-rs_sm = input.int(30, "Regular Start Min EST",      minval=0, maxval=59, group="Regular Session Window")
-rs_eh = input.int(10, "Regular End Hour EST",       minval=0, maxval=23, group="Regular Session Window")
-rs_em = input.int(15, "Regular End Min EST",        minval=0, maxval=59, group="Regular Session Window")
+rs_sh = input.int(9,  "Regular Start Hour EST",     minval=0, maxval=23, group="Regular Session")
+rs_sm = input.int(30, "Regular Start Min",           minval=0, maxval=59, group="Regular Session")
+rs_eh = input.int(11, "Regular End Hour EST",        minval=0, maxval=23, group="Regular Session")
+rs_em = input.int(30, "Regular End Min",             minval=0, maxval=59, group="Regular Session",
+     tooltip="Extended to 11:30 — momentum can run past 10:15.")
 
-// After-hours window
-ah_sh = input.int(16, "After-Hours Start Hour EST", minval=0, maxval=23, group="After-Hours Window")
-ah_sm = input.int(0,  "After-Hours Start Min EST",  minval=0, maxval=59, group="After-Hours Window")
-ah_eh = input.int(19, "After-Hours End Hour EST",   minval=0, maxval=23, group="After-Hours Window")
-ah_em = input.int(30, "After-Hours End Min EST",    minval=0, maxval=59, group="After-Hours Window")
+ah_sh = input.int(16, "After-Hours Start Hour EST",  minval=0, maxval=23, group="After-Hours")
+ah_sm = input.int(0,  "After-Hours Start Min",       minval=0, maxval=59, group="After-Hours")
+ah_eh = input.int(19, "After-Hours End Hour EST",    minval=0, maxval=23, group="After-Hours")
+ah_em = input.int(30, "After-Hours End Min",          minval=0, maxval=59, group="After-Hours")
 
-eff_gap  = backtest_mode ? 8.0 : min_gap
-eff_vol  = backtest_mode ? 1.5 : min_rel_vol
-eff_conf = backtest_mode ? 3   : 4
+// Effective thresholds
+eff_gap = backtest_mode ? 5.0 : min_gap
+eff_vol = backtest_mode ? 1.5 : min_rel_vol
 
-// ── TIME HELPERS ──────────────────────────────────────────────────────────────
+// ── TIME ─────────────────────────────────────────────────────────────────────
 hour_est   = hour(time, "America/New_York")
 minute_est = minute(time, "America/New_York")
 time_est   = hour_est * 100 + minute_est
 new_day    = not na(dayofweek[1]) and dayofweek != dayofweek[1]
 
-// Session detection
-pm_start        = pm_sh * 100 + pm_sm
-pm_end          = pm_eh * 100 + pm_em
-rs_start        = rs_sh * 100 + rs_sm
-rs_end          = rs_eh * 100 + rs_em
-ah_start        = ah_sh * 100 + ah_sm
-ah_end          = ah_eh * 100 + ah_em
+pm_start = pm_sh * 100 + pm_sm
+pm_end   = pm_eh * 100 + pm_em
+rs_start = rs_sh * 100 + rs_sm
+rs_end   = rs_eh * 100 + rs_em
+ah_start = ah_sh * 100 + ah_sm
+ah_end   = ah_eh * 100 + ah_em
 
-in_premarket    = time_est >= pm_start and time_est < pm_end
-in_regular      = time_est >= rs_start and time_est < rs_end
-in_afterhours   = time_est >= ah_start and time_est < ah_end
-in_any_window   = in_premarket or in_regular or in_afterhours
+in_premarket  = time_est >= pm_start and time_est < pm_end
+in_regular    = time_est >= rs_start and time_est < rs_end
+in_afterhours = time_est >= ah_start and time_est < ah_end
+in_any_window = in_premarket or in_regular or in_afterhours
 
-// ── SECTION 2: INDICATORS ─────────────────────────────────────────────────────
+// ── INDICATORS ───────────────────────────────────────────────────────────────
 atr14 = ta.atr(14)
 vwap  = ta.vwap(hlc3)
 ema9  = ta.ema(close, 9)
 ema20 = ta.ema(close, 20)
 rsi14 = ta.rsi(close, 14)
 
-plot(vwap,  "VWAP",  color=color.blue,   linewidth=2)
-plot(ema9,  "9 EMA", color=color.orange, linewidth=1)
-plot(ema20, "20 EMA",color=color.yellow, linewidth=1)
+plot(vwap,  "VWAP",   color=color.blue,   linewidth=2)
+plot(ema9,  "9 EMA",  color=color.orange,  linewidth=1)
+plot(ema20, "20 EMA", color=color.yellow,  linewidth=1)
 
-// ── SECTION 3: MARKET TEMPERATURE ────────────────────────────────────────────
+// ── MARKET TEMPERATURE ───────────────────────────────────────────────────────
 bar_change_pct = na(close[1]) or close[1] == 0.0 ? 0.0 : (close - close[1]) / close[1] * 100
 
 var float max_change_today = 0.0
@@ -142,13 +130,12 @@ else if COLD
 else
     color.gray
 
-// ── SECTION 4: PRE-MARKET HIGH ────────────────────────────────────────────────
+// ── PRE-MARKET HIGH ──────────────────────────────────────────────────────────
 var float premarket_high = 0.0
 var label pmh_lbl        = na
 
 if new_day
     premarket_high := 0.0
-
 if in_premarket
     premarket_high := math.max(premarket_high, high)
 
@@ -175,9 +162,9 @@ if barstate.islast and effective_pmh > 0
                  style=label.style_label_left, color=color.orange,
                  textcolor=color.black, size=size.small)
 
-// ── SECTION 5: VOLUME ─────────────────────────────────────────────────────────
+// ── VOLUME ───────────────────────────────────────────────────────────────────
 avg_vol      = ta.sma(volume, 20)
-avg_vol_10   = ta.sma(volume, 10)   // shorter average for extended-hours volume
+avg_vol_10   = ta.sma(volume, 10)
 rel_vol      = avg_vol > 0 ? volume / avg_vol : 0.0
 recent_vol   = volume    + volume[1] + volume[2]
 earlier_vol  = volume[4] + volume[5] + volume[6]
@@ -185,7 +172,7 @@ vol_building = recent_vol > earlier_vol
 vol_trend    = vol_building ? "BUILDING" : "FADING"
 vol_color    = vol_building ? color.green : color.red
 
-// ── SECTION 6: GAP CALCULATION ────────────────────────────────────────────────
+// ── GAP CALCULATION ──────────────────────────────────────────────────────────
 daily_avg5_close = request.security(syminfo.tickerid, "D", ta.sma(close, 5)[1],
                    lookahead=barmerge.lookahead_off)
 
@@ -208,136 +195,104 @@ if first_bar
         0.0
     first_bar := false
 
-// ── SECTION 7: ENTRY LOGIC ────────────────────────────────────────────────────
+// ── ENTRY LOGIC — ONE SIGNAL, ALL SESSIONS ───────────────────────────────────
+// Momentum breakout: price clears the highest high of last N bars + volume surge
+// This catches the move when it's HAPPENING, not after a pullback.
 
-// --- REGULAR SESSION: VWAP Reclaim ---
-// After gap open, price pulls back to VWAP, then reclaims it.
-var bool touched_vwap = false
-if new_day
-    touched_vwap := false
-if in_regular and close <= vwap
-    touched_vwap := true
+highest_N     = ta.highest(high, breakout_len)
+breakout      = close > highest_N[1] and close > open    // new high + bullish candle
+vol_surge     = volume > avg_vol * eff_vol                // volume confirms it's real
+rsi_ok        = rsi14 > 30 and rsi14 < 80                 // not dead, not blow-off top
+gap_ok        = gap_pct >= eff_gap
+above_ema     = close > ema9                              // trend intact
+no_position   = strategy.position_size == 0
 
-vwap_reclaim = touched_vwap and in_regular and close > vwap and close[1] <= vwap
+can_entry = in_date_range and in_any_window and breakout and vol_surge and rsi_ok and gap_ok and temp_ok and above_ema and no_position
 
-// --- EXTENDED HOURS: Rolling High Breakout ---
-// Price makes a new high vs the last 10 bars — momentum continuation.
-// Uses shorter volume average (10-bar) since regular-session avg inflates the bar.
-highest_10    = ta.highest(high, 10)
-rolling_break = close > highest_10[1] and close > open
-ext_vol_ok    = volume > avg_vol_10 * eff_vol
-
-ext_breakout  = (in_premarket or in_afterhours) and rolling_break and ext_vol_ok
-
-// ── SECTION 8: SHARED FILTERS AND CONFIDENCE ─────────────────────────────────
-rsi_ok      = rsi14 > 35 and rsi14 < 80
-gap_ok      = gap_pct >= eff_gap
-no_position = strategy.position_size == 0
-
-c1 = close > vwap                ? 1 : 0
-c2 = close > ema9                ? 1 : 0
-c3 = volume > avg_vol * 3        ? 1 : 0
-c4 = gap_pct > 15                ? 1 : 0
-c5 = HOT or SCORCHING            ? 1 : 0
-c6 = rsi14 >= 40 and rsi14 <= 75 ? 1 : 0
-confidence = c1 + c2 + c3 + c4 + c5 + c6
-
-// ── SECTION 9: TRADE COUNTER (replaces traded_today boolean) ─────────────────
-var int trades_today = 0
-if new_day
-    trades_today := 0
-
-can_take_trade = no_position and trades_today < max_daily
-
-// Final entry gates — all require in_date_range so flat history is ignored
-can_regular = in_date_range and vwap_reclaim and rsi_ok and gap_ok and temp_ok and volume > avg_vol * eff_vol and close > ema9 and can_take_trade and confidence >= eff_conf
-can_ext     = in_date_range and ext_breakout and rsi_ok and gap_ok and temp_ok and can_take_trade and confidence >= eff_conf
-
-// Backtest pipeline test entry
-ema_cross      = ta.crossover(close, ema9)
-can_simple     = in_date_range and backtest_mode and ema_cross and volume > avg_vol and rsi14 > 50 and close > vwap and can_take_trade and not can_regular and not can_ext
-
-// ── SECTION 10: ENTRY EXECUTION ───────────────────────────────────────────────
+// ── ENTRY EXECUTION ──────────────────────────────────────────────────────────
 var int   entry_bar    = 0
+var float entry_price  = na
 var float entry_stop   = na
-var float entry_target = na
+var float highest_since = na
 var line  stop_line    = na
-var line  target_line  = na
 
-// Regular session — VWAP Reclaim entry
-if can_regular
-    stop_px  = low - atr14 * atr_mult
-    risk_pts = close - stop_px
-    tgt      = close + risk_pts * rr_input
+if can_entry
+    stop_px     = low - atr14 * atr_mult
     entry_stop   := stop_px
-    entry_target := tgt
+    entry_price  := close
     entry_bar    := bar_index
-    trades_today += 1
-    strategy.entry("Regular", strategy.long, comment="VR")
-    strategy.exit("Reg Exit", "Regular", stop=entry_stop, limit=entry_target)
+    highest_since := high
+
+    session_tag = if in_premarket
+        "PM"
+    else if in_regular
+        "REG"
+    else
+        "AH"
+
+    strategy.entry("Momentum", strategy.long, comment=session_tag)
+    strategy.exit("Hard Stop", "Momentum", stop=entry_stop)
+
     if not na(stop_line)
         line.delete(stop_line)
-    if not na(target_line)
-        line.delete(target_line)
-    stop_line   := line.new(bar_index, entry_stop,   bar_index + 60, entry_stop,   color=color.red,   width=2, style=line.style_dashed)
-    target_line := line.new(bar_index, entry_target, bar_index + 60, entry_target, color=color.green, width=2, style=line.style_dashed)
+    stop_line := line.new(bar_index, entry_stop, bar_index + 60, entry_stop,
+                 color=color.red, width=2, style=line.style_dashed)
 
-// Extended hours — Rolling Breakout entry
-if can_ext
-    stop_px  = low - atr14 * atr_mult
-    risk_pts = close - stop_px
-    tgt      = close + risk_pts * rr_input
-    entry_stop   := stop_px
-    entry_target := tgt
-    entry_bar    := bar_index
-    trades_today += 1
-    strategy.entry("Extended", strategy.long, comment="EXT")
-    strategy.exit("Ext Exit", "Extended", stop=entry_stop, limit=entry_target)
-    if not na(stop_line)
-        line.delete(stop_line)
-    if not na(target_line)
-        line.delete(target_line)
-    stop_line   := line.new(bar_index, entry_stop,   bar_index + 60, entry_stop,   color=color.red,   width=2, style=line.style_dashed)
-    target_line := line.new(bar_index, entry_target, bar_index + 60, entry_target, color=color.green, width=2, style=line.style_dashed)
+plotshape(can_entry, style=shape.triangleup, location=location.belowbar,
+         color=color.green, size=size.normal, title="Momentum Entry")
 
-// Backtest EMA test entry
-if can_simple
-    s_stop   = close - atr14 * atr_mult
-    s_target = close + (close - s_stop) * rr_input
-    entry_stop   := s_stop
-    entry_target := s_target
-    entry_bar    := bar_index
-    trades_today += 1
-    strategy.entry("EMATest", strategy.long, comment="ET")
-    strategy.exit("EMATest Exit", "EMATest", stop=s_stop, limit=s_target)
+// ── TRAILING STOP + EXITS ────────────────────────────────────────────────────
+// Track highest high since entry. Once profit > 1R, start trailing.
+// Trail = highest high since entry minus (ATR * trail multiplier)
 
-plotshape(can_regular, style=shape.triangleup, location=location.belowbar, color=color.green,  size=size.normal, title="VWAP Reclaim (Regular)")
-plotshape(can_ext,     style=shape.triangleup, location=location.belowbar, color=color.yellow, size=size.normal, title="Breakout (Extended Hours)")
-plotshape(can_simple,  style=shape.diamond,    location=location.belowbar, color=color.aqua,   size=size.small,  title="EMA Test")
+if strategy.position_size > 0
+    highest_since := math.max(nz(highest_since, high), high)
 
-// ── SECTION 11: EXITS ─────────────────────────────────────────────────────────
-if strategy.position_size > 0 and bar_index - entry_bar > 60
+    risk_1r       = nz(entry_price, close) - nz(entry_stop, close - atr14)
+    profit_now    = close - nz(entry_price, close)
+    past_1r       = profit_now >= risk_1r and risk_1r > 0
+
+    // Trailing stop: tighten once past 1R
+    if past_1r
+        trail_level = highest_since - atr14 * trail_atr
+        // Only move stop UP, never down
+        if trail_level > nz(entry_stop, 0)
+            entry_stop := trail_level
+            strategy.exit("Trail Stop", "Momentum", stop=entry_stop)
+            // Update the stop line
+            if not na(stop_line)
+                line.delete(stop_line)
+            stop_line := line.new(bar_index - 5, entry_stop, bar_index + 30, entry_stop,
+                         color=color.fuchsia, width=2, style=line.style_dashed)
+
+// Time stop — don't sit in dead trades
+if strategy.position_size > 0 and bar_index - entry_bar > time_stop
     strategy.close("Time Stop")
 
-if strategy.position_size > 0 and in_regular and close < vwap
+// VWAP stop — only in regular session (extended hours VWAP is unreliable)
+if strategy.position_size > 0 and in_regular and close < vwap and close < ema9
     strategy.close("VWAP Stop")
 
-// ── SECTION 12: ALERTS ────────────────────────────────────────────────────────
-if can_regular
-    alert('{"action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(entry_stop) + ',"target":' + str.tostring(entry_target) + ',"confidence":' + str.tostring(confidence) + ',"reason":"VWAP reclaim - regular session","session":"regular","change_pct":' + str.tostring(math.round(gap_pct, 2)) + ',"relative_volume":' + str.tostring(math.round(rel_vol, 2)) + '}', alert.freq_once_per_bar_close)
+// Reset tracking vars on flat
+if strategy.position_size == 0 and strategy.position_size[1] > 0
+    highest_since := na
+    entry_price   := na
 
-if can_ext
-    session_name = in_premarket ? "pre-market" : "after-hours"
-    alert('{"action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(entry_stop) + ',"target":' + str.tostring(entry_target) + ',"confidence":' + str.tostring(confidence) + ',"reason":"Rolling breakout - ' + session_name + '","session":"' + session_name + '","change_pct":' + str.tostring(math.round(gap_pct, 2)) + ',"relative_volume":' + str.tostring(math.round(rel_vol, 2)) + '}', alert.freq_once_per_bar_close)
-
-if can_simple
-    alert('{"action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(entry_stop) + ',"target":' + str.tostring(entry_target) + ',"confidence":' + str.tostring(confidence) + ',"reason":"EMA test - backtest","session":"regular","change_pct":' + str.tostring(math.round(gap_pct, 2)) + ',"relative_volume":' + str.tostring(math.round(rel_vol, 2)) + '}', alert.freq_once_per_bar_close)
+// ── ALERTS ───────────────────────────────────────────────────────────────────
+if can_entry
+    session_name = if in_premarket
+        "pre-market"
+    else if in_regular
+        "regular"
+    else
+        "after-hours"
+    alert('{"action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(entry_stop) + ',"session":"' + session_name + '","gap_pct":' + str.tostring(math.round(gap_pct, 2)) + ',"rel_vol":' + str.tostring(math.round(rel_vol, 2)) + ',"rsi":' + str.tostring(math.round(rsi14, 1)) + '}', alert.freq_once_per_bar_close)
 
 if strategy.position_size[1] > 0 and strategy.position_size == 0
-    alert('{"action":"close","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"reason":"exit triggered"}', alert.freq_once_per_bar_close)
+    alert('{"action":"close","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + '}', alert.freq_once_per_bar_close)
 
-// ── SECTION 13: INFO TABLE ────────────────────────────────────────────────────
-var table info_tbl = table.new(position.top_right, 2, 12,
+// ── INFO TABLE ───────────────────────────────────────────────────────────────
+var table info_tbl = table.new(position.top_right, 2, 11,
      bgcolor=color.new(color.black, 70), border_color=color.gray, border_width=1)
 
 current_session = if in_premarket
@@ -358,38 +313,40 @@ else if in_afterhours
 else
     color.gray
 
+in_trade_now = strategy.position_size > 0
+trade_pnl    = in_trade_now ? (close - nz(entry_price, close)) / nz(entry_price, close) * 100 : 0.0
+
 if barstate.islast
-    table.cell(info_tbl, 0, 0,  "Cameron Ross",   text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 40))
-    table.cell(info_tbl, 1, 0,  backtest_mode ? "BACKTEST" : "$500 LIVE", text_color=backtest_mode ? color.yellow : color.lime, text_size=size.small, bgcolor=color.new(color.purple, 40))
-    table.cell(info_tbl, 0, 1,  "Session",         text_color=color.white,   text_size=size.small)
-    table.cell(info_tbl, 1, 1,  current_session,   text_color=session_color, text_size=size.small)
-    table.cell(info_tbl, 0, 2,  "Temperature",     text_color=color.white,   text_size=size.small)
-    table.cell(info_tbl, 1, 2,  temp_label,        text_color=temp_color,    text_size=size.small)
-    table.cell(info_tbl, 0, 3,  "Gap %",           text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 0, 0,  "PulseWebhook",    text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 40))
+    table.cell(info_tbl, 1, 0,  backtest_mode ? "BACKTEST" : "LIVE", text_color=backtest_mode ? color.yellow : color.lime, text_size=size.small, bgcolor=color.new(color.purple, 40))
+    table.cell(info_tbl, 0, 1,  "Session",          text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 1, 1,  current_session,    text_color=session_color, text_size=size.small)
+    table.cell(info_tbl, 0, 2,  "Temperature",      text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 1, 2,  temp_label,         text_color=temp_color,    text_size=size.small)
+    table.cell(info_tbl, 0, 3,  "Gap %",            text_color=color.white,   text_size=size.small)
     table.cell(info_tbl, 1, 3,  str.tostring(math.round(gap_pct, 2)) + "%", text_color=gap_pct >= eff_gap ? color.green : color.red, text_size=size.small)
-    table.cell(info_tbl, 0, 4,  pmh_tag,           text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 0, 4,  pmh_tag,            text_color=color.white,   text_size=size.small)
     table.cell(info_tbl, 1, 4,  str.tostring(effective_pmh, "#.##"), text_color=color.orange, text_size=size.small)
-    table.cell(info_tbl, 0, 5,  "VWAP",            text_color=color.white,   text_size=size.small)
-    table.cell(info_tbl, 1, 5,  str.tostring(vwap, "#.##"), text_color=color.blue, text_size=size.small)
-    table.cell(info_tbl, 0, 6,  "VWAP Reclaim",    text_color=color.white,   text_size=size.small)
-    table.cell(info_tbl, 1, 6,  touched_vwap ? "READY" : "Waiting", text_color=touched_vwap ? color.lime : color.gray, text_size=size.small)
-    table.cell(info_tbl, 0, 7,  "Volume Trend",    text_color=color.white,   text_size=size.small)
-    table.cell(info_tbl, 1, 7,  vol_trend,         text_color=vol_color,     text_size=size.small)
-    table.cell(info_tbl, 0, 8,  "Confidence",      text_color=color.white,   text_size=size.small)
-    table.cell(info_tbl, 1, 8,  str.tostring(confidence) + " / 6", text_color=confidence >= eff_conf ? color.green : color.red, text_size=size.small)
-    table.cell(info_tbl, 0, 9,  "Rel Volume",      text_color=color.white,   text_size=size.small)
-    table.cell(info_tbl, 1, 9,  str.tostring(math.round(rel_vol, 2)) + "x", text_color=rel_vol >= eff_vol ? color.green : color.gray, text_size=size.small)
-    table.cell(info_tbl, 0, 10, "Trades Today",    text_color=color.white,   text_size=size.small)
-    table.cell(info_tbl, 1, 10, str.tostring(trades_today) + " / " + str.tostring(max_daily), text_color=trades_today >= max_daily ? color.red : color.green, text_size=size.small)
-    table.cell(info_tbl, 0, 11, "Entry Window",    text_color=color.white,   text_size=size.small)
-    table.cell(info_tbl, 1, 11, in_any_window ? "ACTIVE" : "CLOSED", text_color=in_any_window ? color.lime : color.gray, text_size=size.small)
+    table.cell(info_tbl, 0, 5,  "Volume",           text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 1, 5,  str.tostring(math.round(rel_vol, 2)) + "x  " + vol_trend, text_color=vol_color, text_size=size.small)
+    table.cell(info_tbl, 0, 6,  "RSI",              text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 1, 6,  str.tostring(math.round(rsi14, 1)), text_color=rsi_ok ? color.green : color.red, text_size=size.small)
+    table.cell(info_tbl, 0, 7,  "Entry Window",     text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 1, 7,  in_any_window ? "OPEN" : "CLOSED", text_color=in_any_window ? color.lime : color.gray, text_size=size.small)
+    table.cell(info_tbl, 0, 8,  "Position",         text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 1, 8,  in_trade_now ? str.tostring(math.round(trade_pnl, 2)) + "%" : "FLAT", text_color=in_trade_now ? (trade_pnl >= 0 ? color.lime : color.red) : color.gray, text_size=size.small)
+    table.cell(info_tbl, 0, 9,  "Stop",             text_color=color.white,   text_size=size.small)
+    table.cell(info_tbl, 1, 9,  in_trade_now ? str.tostring(entry_stop, "#.##") : "—", text_color=color.red, text_size=size.small)
+    table.cell(info_tbl, 0, 10, "Trail Active",     text_color=color.white,   text_size=size.small)
+    trailed = in_trade_now and not na(entry_price) and not na(entry_stop) and (close - entry_price) >= (entry_price - entry_stop)
+    table.cell(info_tbl, 1, 10, in_trade_now ? (trailed ? "YES" : "NO") : "—", text_color=trailed ? color.lime : color.gray, text_size=size.small)
 
-// ── DEBUG VALUES (Data Window only — hover over any bar to see) ───────────────
-plot(effective_pmh, "PMH Debug",    color=color.orange, display=display.data_window)
-plot(gap_pct,       "Gap Debug",    color=color.yellow, display=display.data_window)
-plot(rel_vol,       "RelVol Debug", color=color.blue,   display=display.data_window)
-plot(confidence,    "Conf Debug",   color=color.white,  display=display.data_window)
+// ── DEBUG (Data Window only) ─────────────────────────────────────────────────
+plot(effective_pmh,    "PMH Debug",     color=color.orange, display=display.data_window)
+plot(gap_pct,          "Gap Debug",     color=color.yellow, display=display.data_window)
+plot(rel_vol,          "RelVol Debug",  color=color.blue,   display=display.data_window)
+plot(nz(entry_stop),   "Stop Debug",   color=color.red,    display=display.data_window)
+plot(nz(highest_since),"Trail Hi Debug",color=color.lime,   display=display.data_window)
 
-// ── Hidden series for alert placeholders ──────────────────────────────────────
-plot(entry_stop,   "stop_price",   display=display.none)
-plot(entry_target, "target_price", display=display.none)
+// ── Hidden series for alert placeholders ─────────────────────────────────────
+plot(entry_stop, "stop_price", display=display.none)
