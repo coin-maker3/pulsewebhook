@@ -151,9 +151,10 @@ if time_est >= 935 and not orb_done and not na(orb_high)
     orb_done := true
 
 // Stop price: ORB low is primary. Fall back to ATR if ORB low is invalid.
-orb_stop_px = orb_done and not na(orb_low) and orb_low < close
-              ? orb_low
-              : close - ta.atr(14) * atr_mult
+orb_stop_px = if orb_done and not na(orb_low) and orb_low < close
+    orb_low
+else
+    close - ta.atr(14) * atr_mult
 
 // Plot ORB levels as horizontal lines on chart
 plot(orb_done and not na(orb_high) ? orb_high : na, "ORB High",
@@ -162,8 +163,7 @@ plot(orb_done and not na(orb_low)  ? orb_low  : na, "ORB Low",
      color=color.red,  linewidth=2, style=plot.style_line)
 
 // Breakout signal: close crosses above the ORB high
-broke_orb = orb_done and not na(orb_high) and
-            close > orb_high and close[1] <= orb_high
+broke_orb = orb_done and not na(orb_high) and close > orb_high and close[1] <= orb_high
 
 // ── SECTION 4: VOLUME ANALYSIS ────────────────────────────────────────────────
 avg_vol      = ta.sma(volume, 20)
@@ -337,9 +337,18 @@ if strategy.position_size[1] > 0 and strategy.position_size == 0
 var table info_tbl = table.new(position.top_right, 2, 11,
      bgcolor=color.new(color.black, 70), border_color=color.gray, border_width=1)
 
-orb_status = not orb_done and time_est >= 930 and time_est < 935 ? "FORMING" :
-             orb_done ? "SET" : "WAITING"
-orb_status_color = orb_done ? color.lime : time_est >= 930 ? color.yellow : color.gray
+orb_status = if orb_done
+    "SET"
+else if not orb_done and time_est >= 930 and time_est < 935
+    "FORMING"
+else
+    "WAITING"
+orb_status_color = if orb_done
+    color.lime
+else if time_est >= 930
+    color.yellow
+else
+    color.gray
 
 if barstate.islast
     table.cell(info_tbl, 0, 0,  "Cameron Ross ORB",
