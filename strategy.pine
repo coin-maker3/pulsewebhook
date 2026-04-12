@@ -124,6 +124,9 @@ if barstate.islast and effective_pmh > 0
                  style=label.style_label_left, color=color.orange,
                  textcolor=color.black, size=size.small)
 
+// Declared early so orb_stop_px can reference it before Section 5
+atr14 = ta.atr(14)
+
 // ── SECTION 3B: OPENING RANGE BREAKOUT ───────────────────────────────────────
 // The Opening Range = highest high and lowest low of the first 5 candles
 // (9:30, 9:31, 9:32, 9:33, 9:34 on a 1-minute chart).
@@ -154,7 +157,7 @@ if time_est >= 935 and not orb_done and not na(orb_high)
 orb_stop_px = if orb_done and not na(orb_low) and orb_low < close
     orb_low
 else
-    close - ta.atr(14) * atr_mult
+    close - atr14 * atr_mult
 
 // Plot ORB levels as horizontal lines on chart
 plot(orb_done and not na(orb_high) ? orb_high : na, "ORB High",
@@ -178,7 +181,6 @@ vol_color    = vol_building ? color.green : color.red
 vwap  = ta.vwap(hlc3)
 ema9  = ta.ema(close, 9)
 ema20 = ta.ema(close, 20)
-atr14 = ta.atr(14)
 rsi14 = ta.rsi(close, 14)
 
 plot(vwap,  "VWAP",  color=color.blue,   linewidth=2)
