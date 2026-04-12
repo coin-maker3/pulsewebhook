@@ -300,11 +300,13 @@ if barstate.islast
     table.cell(info_tbl, 0, 10, "Traded Today",  text_color=color.white, text_size=size.small)
     table.cell(info_tbl, 1, 10, traded_today ? "YES — done for the day" : "NO", text_color=traded_today ? color.red : color.green, text_size=size.small)
 
-// ── DEBUG PLOTS ───────────────────────────────────────────────────────────────
-plot(effective_pmh, "PMH Debug",    color=color.orange, display=display.all)
-plot(gap_pct,       "Gap Debug",    color=color.yellow, display=display.all)
-plot(rel_vol,       "RelVol Debug", color=color.blue,   display=display.all)
-plot(confidence,    "Conf Debug",   color=color.white,  display=display.all)
+// ── DEBUG VALUES (Data Window only — not plotted on price chart) ──────────────
+// Hover over any bar in TradingView to see these in the Data Window panel.
+// They are hidden from the chart so they don't cover your candles.
+plot(effective_pmh, "PMH Debug",    color=color.orange, display=display.data_window)
+plot(gap_pct,       "Gap Debug",    color=color.yellow, display=display.data_window)
+plot(rel_vol,       "RelVol Debug", color=color.blue,   display=display.data_window)
+plot(confidence,    "Conf Debug",   color=color.white,  display=display.data_window)
 
 // ── Hidden series for alert placeholders ──────────────────────────────────────
 plot(entry_stop,   "stop_price",   display=display.none)
