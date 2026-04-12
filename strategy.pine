@@ -46,6 +46,15 @@ strategy("Cameron Ross — Multi-Session", overlay=true,
 backtest_mode = input.bool(true, "Backtest Mode (Lower Thresholds)",
      tooltip="ON: gap 8%, rel vol 1.5x, confidence 3. Turn OFF for live trading.")
 
+// Set this to the day the stock first appeared on your scanner / started gapping.
+// The strategy will ignore all bars before this date so flat history is excluded.
+start_date = input.time(timestamp("2024-01-01 00:00"), "Backtest Start Date",
+     tooltip="Set to the day the stock hit your Webull scanner. Ignores all flat history before this date.", group="Backtest Range")
+end_date   = input.time(timestamp("2099-12-31 00:00"), "Backtest End Date",
+     tooltip="Leave at default to run to present. Set to limit the test window.", group="Backtest Range")
+
+in_date_range = time >= start_date and time <= end_date
+
 min_gap        = input.float(15.0, "Min Gap % (live)",      minval=0.0, step=1.0,  group="Filters")
 min_rel_vol    = input.float(3.0,  "Min Rel Volume (live)", minval=0.1, step=0.1,  group="Filters")
 rr_input       = input.float(2.5,  "Risk/Reward Target",    minval=0.5, step=0.1,  group="Filters")
@@ -240,13 +249,13 @@ if new_day
 
 can_take_trade = no_position and trades_today < max_daily
 
-// Final entry gates
-can_regular = vwap_reclaim and rsi_ok and gap_ok and temp_ok and volume > avg_vol * eff_vol and close > ema9 and can_take_trade and confidence >= eff_conf
-can_ext     = ext_breakout and rsi_ok and gap_ok and temp_ok and can_take_trade and confidence >= eff_conf
+// Final entry gates — all require in_date_range so flat history is ignored
+can_regular = in_date_range and vwap_reclaim and rsi_ok and gap_ok and temp_ok and volume > avg_vol * eff_vol and close > ema9 and can_take_trade and confidence >= eff_conf
+can_ext     = in_date_range and ext_breakout and rsi_ok and gap_ok and temp_ok and can_take_trade and confidence >= eff_conf
 
 // Backtest pipeline test entry
 ema_cross      = ta.crossover(close, ema9)
-can_simple     = backtest_mode and ema_cross and volume > avg_vol and rsi14 > 50 and close > vwap and can_take_trade and not can_regular and not can_ext
+can_simple     = in_date_range and backtest_mode and ema_cross and volume > avg_vol and rsi14 > 50 and close > vwap and can_take_trade and not can_regular and not can_ext
 
 // ── SECTION 10: ENTRY EXECUTION ───────────────────────────────────────────────
 var int   entry_bar    = 0
