@@ -219,8 +219,7 @@ rsi_ok       = rsi14 > 35 and rsi14 < 75
 gap_ok       = gap_pct >= eff_gap
 no_position  = strategy.position_size == 0
 
-entry_signal = in_entry_window and broke_orb and volume_surge and
-               above_vwap and rsi_ok and temp_ok and gap_ok and no_position
+entry_signal = in_entry_window and broke_orb and volume_surge and above_vwap and rsi_ok and temp_ok and gap_ok and no_position
 
 // ── SECTION 8: ONE TRADE PER DAY ─────────────────────────────────────────────
 var bool traded_today = false
@@ -240,8 +239,7 @@ can_entry = entry_signal and not traded_today and confidence >= eff_conf
 
 // ── EMA CROSSOVER TEST ENTRY (backtest mode only) ─────────────────────────────
 ema_cross     = ta.crossover(close, ema9)
-simple_signal = backtest_mode and ema_cross and volume > avg_vol and
-                rsi14 > 50 and above_vwap and no_position and not traded_today
+simple_signal = backtest_mode and ema_cross and volume > avg_vol and rsi14 > 50 and above_vwap and no_position and not traded_today
 can_simple    = simple_signal and not can_entry
 
 // ── SECTION 9: ENTRY EXECUTION ────────────────────────────────────────────────
