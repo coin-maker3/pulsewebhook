@@ -10,11 +10,12 @@
 // distance returned in the alert JSON.
 // ─────────────────────────────────────────────────────────────────────────────
 strategy("PulseWebhook Pro", overlay=true,
-     default_qty_type  = strategy.percent_of_equity,
-     default_qty_value = 7,
-     commission_type   = strategy.commission.percent,
-     commission_value  = 0.1,
-     slippage          = 2)
+     default_qty_type   = strategy.percent_of_equity,
+     default_qty_value  = 7,
+     commission_type    = strategy.commission.percent,
+     commission_value   = 0.1,
+     slippage           = 2,
+     calc_on_every_tick = true)
 
 // ── SECTION 1: INPUTS ─────────────────────────────────────────────────────────
 // FIX 3: Backtest mode lowers thresholds so historical trades are visible.
@@ -47,8 +48,7 @@ time_est   = hour_est * 100 + minute_est
 new_day    = not na(dayofweek[1]) and dayofweek != dayofweek[1]
 
 // ── SECTION 2: MARKET TEMPERATURE ─────────────────────────────────────────────
-bar_change_pct = na(close[1]) or close[1] == 0.0 ? 0.0 :
-                 (close - close[1]) / close[1] * 100
+bar_change_pct = na(close[1]) or close[1] == 0.0 ? 0.0 : (close - close[1]) / close[1] * 100
 
 var float max_change_today = 0.0
 if new_day
@@ -64,10 +64,16 @@ DEAD      = max_change_today <= 5
 // FIX 3: In backtest mode allow COLD — most historical days are not HOT/SCORCHING
 temp_ok    = backtest_mode ? not DEAD : (SCORCHING or HOT or WARM)
 temp_label = SCORCHING ? "SCORCHING" : HOT ? "HOT" : WARM ? "WARM" : COLD ? "COLD" : "DEAD"
-temp_color = SCORCHING ? color.white  :
-             HOT        ? color.green  :
-             WARM       ? color.yellow :
-             COLD       ? color.blue   : color.gray
+temp_color = if SCORCHING
+    color.white
+else if HOT
+    color.green
+else if WARM
+    color.yellow
+else if COLD
+    color.blue
+else
+    color.gray
 
 // ── SECTION 3: PRE-MARKET HIGH — with fallback for backtesting ────────────────
 // FIX 1: Backtesting datasets often contain only regular-session bars (09:30+),
@@ -87,9 +93,14 @@ if in_premarket
 
 // Fallback: pull previous day's high from daily timeframe
 prevday_high  = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
-effective_pmh = premarket_high > 0      ? premarket_high :
-                not na(prevday_high) and prevday_high > 0 ? prevday_high :
-                not na(high[1])         ? high[1] : high
+effective_pmh = if premarket_high > 0
+    premarket_high
+else if not na(prevday_high) and prevday_high > 0
+    prevday_high
+else if not na(high[1])
+    high[1]
+else
+    high
 
 pmh_is_real   = premarket_high > 0    // true = real pre-market data, false = fallback
 pmh_tag       = pmh_is_real ? "PMH" : "PDH"
@@ -145,10 +156,13 @@ if first_bar
     prev_c   = not na(close[1]) and close[1] > 0.0 ? close[1] : na
     raw_gap  = not na(prev_c) ? (open - prev_c) / prev_c * 100 : 0.0
     // Fallback: if gap is zero use 5-day avg close as reference baseline
-    fallback_base = not na(daily_avg5_close) and daily_avg5_close > 0.0 ?
-                    daily_avg5_close : na
-    gap_pct  := raw_gap != 0.0 ? raw_gap :
-                not na(fallback_base) ? (high - fallback_base) / fallback_base * 100 : 0.0
+    fallback_base = not na(daily_avg5_close) and daily_avg5_close > 0.0 ? daily_avg5_close : na
+    gap_pct  := if raw_gap != 0.0
+        raw_gap
+    else if not na(fallback_base)
+        (high - fallback_base) / fallback_base * 100
+    else
+        0.0
     first_bar := false
 
 // ── Entry conditions ──────────────────────────────────────────────────────────
